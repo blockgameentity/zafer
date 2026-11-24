@@ -1,0 +1,46 @@
+name: Nix
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The flake is the Linux build: one job evaluates it, builds the binary and
+  # runs the workspace tests in the sandbox (no GPU, no game data). The
+  # Windows job in ci.yml is untouched and stays the msvc check.
+  nix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      # Installs Nix with flakes enabled and uses the checked-in flake.lock as is
+      # (no `--no-update-lock-file` surprises: the lock is committed).
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Only used when the repository has a cache configured; a missing token
+      # leaves the build to run from source.
+      - uses: cachix/cachix-action@v16
+        if: ${{ vars.CACHIX_CACHE != '' }}
+        with:
+          name: ${{ vars.CACHIX_CACHE }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Flake check
+        run: nix flake check --print-build-logs
+      - name: Build the binary
+        run: nix build .#victory --print-build-logs
+      - name: The shell is the build environment
+        run: nix develop .#default --command cargo check --workspace --all-targets

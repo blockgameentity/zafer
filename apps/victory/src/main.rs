@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -86,6 +87,31 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate every shader found and report what fails, without a GPU
+    /// or the title (the CI-shaped `translate`: a JSON report and an exit
+    /// code).
+    Precompile {
+        paths: Vec<PathBuf>,
+        /// Write the machine-readable report here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Check each emitted module with dxil.dll's validator.
+        #[arg(long)]
+        validate: bool,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Stop at the first failing shader.
+        #[arg(long)]
+        fail_fast: bool,
+        /// Exit zero even when shaders failed (a survey run rather than a
+        /// check). Without it, any failure makes the command exit non-zero.
+        #[arg(long)]
+        no_exit_code: bool,
+        /// Print one line per program and outcome.
+        #[arg(long)]
+        list: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -154,6 +180,15 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        Command::Precompile {
+            paths,
+            report,
+            validate,
+            jobs,
+            fail_fast,
+            no_exit_code,
+            list,
+        } => precompile::run(paths, report, validate, jobs, fail_fast, !no_exit_code, list),
         Command::Run {
             exe,
             unimplemented,

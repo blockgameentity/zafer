@@ -46,6 +46,7 @@ mod sampler;
 pub mod shader_cache;
 mod shadow;
 pub mod signature;
+pub mod vulkan;
 mod texture;
 mod watch;
 

@@ -97,3 +97,20 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+## Host graphics: Vulkan first
+
+The console's memory model is Vulkan's: a GPU address is a CPU address,
+memory is unified, and a read past the end of a resource returns 0 through
+robustness rather than faulting. D3D12 on Linux means vkd3d-proton, one
+translation layer more between the title and the driver, with its own
+address-space and robustness rules to keep in step. So the default host
+graphics target is Vulkan with SPIR-V shaders (planned:
+`crates/victory-gpu/src/vulkan/`, `crates/victory-shader/src/spirv/`, see
+[docs/vulkan-backend.md](vulkan-backend.md)); D3D12 with DXIL stays for
+Windows and for comparing the two.
+
+| Target | Shaders | Status |
+|--------|---------|--------|
+| Vulkan | SPIR-V | default target, planned |
+| D3D12 | DXIL | Windows, and comparison; what runs today |

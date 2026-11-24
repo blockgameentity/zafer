@@ -66,10 +66,16 @@ depends on `victory-loader`, never the other way round.
 
 ## GPU
 
-`victory-gpu` translates D3D12.X to host D3D12 and console shaders to
-DXIL. On Linux the host D3D12 is vkd3d-proton built as native Linux
-libraries and loaded at run time, so the D3D12 code and the shader
-translator stay shared.
+`victory-gpu` translates D3D12.X to a host graphics API and console
+shaders to that API's shader binary: SPIR-V for Vulkan (the default
+target, planned: `crates/victory-gpu/src/vulkan/`,
+[docs/vulkan-backend.md](vulkan-backend.md)) and DXIL for D3D12, which
+`victory translate --backend dxil` still emits. The Vulkan backend removes
+the vkd3d-proton dependency below: it talks to the Vulkan loader directly,
+so no D3D12-on-Vulkan library sits between the title and the driver. Until
+it lands, the host D3D12 is vkd3d-proton built as native Linux libraries
+and loaded at run time, so the D3D12 code and the shader translator stay
+shared.
 
 - **Calling convention.** vkd3d-proton's native build defines
   `STDMETHODCALLTYPE` as nothing (`include/vkd3d_windows.h`): its COM is
@@ -175,17 +181,38 @@ to a window.
 `flake.nix` provides the toolchain pinned in `rust-toolchain.toml` (1.98.1,
 `rustfmt` + `clippy`) through `rust-overlay`, the run-time libraries above on
 `LD_LIBRARY_PATH` (`SDL3`, `vulkan-loader`, `libxkbcommon`, ALSA, PulseAudio,
-OpenSSL, zlib, fontconfig/freetype, Wayland, X11/XCB, OpenGL), and the tools
-to build vkd3d-proton (meson, ninja, clang/lld, python3).
+OpenSSL, zlib, fontconfig/freetype, Wayland, X11/XCB, OpenGL), the shader and
+D3D-on-Vulkan tools (`spirv-val`/`spirv-dis`/`spirv-as`, `glslang`,
+`shaderc`, `vulkaninfo`, `vkd3d`, `dxvk`, `vkd3d-proton`) and the tools to
+build vkd3d-proton by hand (meson, ninja, clang/lld, python3). Every optional
+package is added only when `builtins.hasAttr` finds it in that nixpkgs.
+
+The shell is the build environment; the flake builds the binary with it:
 
 ```sh
 nix develop                 # Linux dev shell (direnv: `.envrc` has `use flake`)
 nix-shell                   # classic nix-shell, imports the same shell
+nix build .#victory         # the release binary, `cargo build -p victory`
+nix build .#default         # the dev environment as a package
+nix flake check             # shells, packages and checks.tests (cargo test)
 nix develop .#windows-cross # x86_64-pc-windows-msvc target installed
 cargo xwin check --workspace --all-targets
-nix build .#default         # the dev environment as a package
-nix flake check             # evaluates the flake and both shells, builds nothing
 ```
+
+`packages.<system>.victory` is a `buildRustPackage` over this checkout with
+`cargoLock.lockFile = ./Cargo.lock`, `cargoBuildFlags = [ "-p" "victory" ]`
+and `CARGO_BUILD_TARGET` unset: a native Linux build, in which
+`crates/victory-windows/build.rs` generates its D3D12/DXGI bindings from
+`windows-bindgen`'s vendored metadata, offline. It needs no GPU and no game
+data; the tests it does not run are in `nix develop`.
+
+`checks.<system>.tests` compiles and runs `cargo test --workspace` in the
+sandbox, one thread at a time in the debug profile: the release test binaries
+and the parallel harness both fault in `victory-hle`'s UCRT stdio tests, which
+install guest stdio state per thread. `xtask`'s `repository_passes_policy` is
+skipped there (it shells out to `git ls-files`, and a store path has no
+repository); CI runs it on a checkout. Nothing in the check needs a GPU: the
+device tests return early without `VICTORY_VKD3D`.
 
 The default shell sets `SDL3` and `VICTORY_SDL3` (the `libSDL3.so.0` path),
 `LD_LIBRARY_PATH` (the libraries above) and `VKD3D_SHADER_CACHE_PATH`
@@ -203,8 +230,10 @@ ninja -C build install
 export VICTORY_VKD3D="$HOME/.local/vkd3d-proton/lib"
 ```
 
-`VICTORY_DXIL` (`libdxil.so`) and `VICTORY_DXCOMPILER` (`libdxcompiler.so`)
-stay hand-set: Microsoft's DXC release is not in nixpkgs, so the shell only
-prints the hint. `cargo-xwin` is packaged in this nixpkgs and sits in the
-`windows-cross` shell; where it is not, that shell prints
-`cargo install cargo-xwin`.
+nixpkgs' `vkd3d-proton` package is the Windows build for DXVK, not the native
+`libvkd3d-proton-d3d12core.so` above, so the shell says so and keeps pointing
+at `VICTORY_VKD3D` instead of guessing. `VICTORY_DXIL` (`libdxil.so`) and
+`VICTORY_DXCOMPILER` (`libdxcompiler.so`) stay hand-set: Microsoft's DXC
+release is not in nixpkgs, so the shell only prints the hint. `cargo-xwin` is
+packaged in this nixpkgs and sits in the `windows-cross` shell; where it is
+not, that shell prints `cargo install cargo-xwin`.
