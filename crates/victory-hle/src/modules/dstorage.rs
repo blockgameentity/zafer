@@ -20,8 +20,10 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -29,7 +31,9 @@ use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
-use crate::{HleModule, hle_export};
+#[cfg(target_os = "linux")]
+use crate::host::host;
+use crate::{HleModule, hle_export, registry};
 
 /// The factory interface Grand Theft Auto VI asks for.
 const FACTORY: Guid = Guid::new(
@@ -49,7 +53,7 @@ type Out = *mut *mut c_void;
 
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
-pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+pub extern "win64" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
@@ -82,12 +86,12 @@ impl<T> Instance<T> {
     }
 }
 
-extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
+extern "win64" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
     // SAFETY: an instance we created and the title still holds.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+extern "win64" fn release<T>(this: *mut Instance<T>) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
@@ -102,11 +106,50 @@ fn iid_text(iid: *const Guid) -> String {
     unsafe { iid.as_ref() }.map_or_else(|| "null".into(), Guid::to_string)
 }
 
+/// `HRESULT_FROM_WIN32` of a Windows error code.
+fn hresult(code: u32) -> HRESULT {
+    (0x8007_0000 | (code & 0xffff)) as i32
+}
+
 /// `HRESULT_FROM_WIN32` of a host error.
 fn from_win32(error: &std::io::Error) -> HRESULT {
-    error
-        .raw_os_error()
-        .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
+    #[cfg(target_os = "linux")]
+    let code = Some(crate::linux::kernel32_file::win32_error(error));
+    #[cfg(windows)]
+    let code = error.raw_os_error().map(|e| e as u32);
+    code.map_or(E_INVALIDARG, hresult)
+}
+
+/// The title's last error (`GetLastError`).
+fn last_error() -> u32 {
+    #[cfg(target_os = "linux")]
+    return victory_loader::linux::teb::last_error();
+    #[cfg(windows)]
+    // SAFETY: no preconditions.
+    unsafe {
+        windows_sys::Win32::Foundation::GetLastError()
+    }
+}
+
+/// The file behind a handle from `CreateFileW`, which the file now owns.
+#[cfg(windows)]
+fn into_file(handle: *mut c_void) -> std::fs::File {
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: a handle we just opened and nobody else owns.
+    unsafe { std::fs::File::from_raw_handle(handle) }
+}
+
+/// See the Windows twin: on Linux the handle is our handle table's, so the
+/// file gets a duplicate of its descriptor and the handle is closed.
+#[cfg(target_os = "linux")]
+fn into_file(handle: *mut c_void) -> std::fs::File {
+    use std::os::fd::BorrowedFd;
+    let file = crate::linux::kernel32_file::file(handle).expect("CreateFileW gives a file handle");
+    // SAFETY: the descriptor stays open while `file` holds it.
+    let fd = unsafe { BorrowedFd::borrow_raw(file.fd()) }.try_clone_to_owned();
+    drop(file);
+    host!("kernel32.dll", "CloseHandle": extern "win64" fn(*mut c_void) -> i32)(handle);
+    std::fs::File::from(fd.expect("a free descriptor"))
 }
 
 // The factory.
@@ -114,15 +157,26 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
-extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+extern "win64" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
-    let handle = super::files::CreateFileW(
+    // What the title's own import is bound to (`files` where it binds it),
+    // so paths on our virtual drives work too.
+    type CreateFileW =
+        extern "win64" fn(*const u16, u32, u32, *const c_void, u32, u32, *mut c_void) -> *mut c_void;
+    static CREATE: OnceLock<usize> = OnceLock::new();
+    let create = *CREATE.get_or_init(|| {
+        registry::lookup("kernel32.dll", "CreateFileW")
+            .or_else(|| crate::host::function("kernel32.dll", "CreateFileW"))
+            .expect("CreateFileW")
+    });
+    // SAFETY: the address of a CreateFileW.
+    let create = unsafe { std::mem::transmute::<usize, CreateFileW>(create) };
+    let handle = create(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
@@ -137,19 +191,18 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
     if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-        return from_win32(&error);
+        let error = last_error();
+        tracing::warn!(path = name, error, "dstorage: opening a file failed");
+        return hresult(error);
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
-    // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let file = into_file(handle);
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
     put(out, file)
 }
 
 /// `(capacity, name, iid, out)`.
-extern "system" fn create_status_array(
+extern "win64" fn create_status_array(
     _: Factory,
     capacity: u32,
     name: *const c_char,
@@ -181,7 +234,7 @@ struct QueueDesc {
     unknown: u64,
 }
 
-extern "system" fn create_queue(
+extern "win64" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
     iid: *const Guid,
@@ -217,7 +270,7 @@ extern "system" fn create_queue(
 }
 
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
-extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
+extern "win64" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size);
@@ -281,7 +334,7 @@ type Array = *mut Instance<StatusArray>;
 
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
-extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+extern "win64" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
     entries
@@ -291,7 +344,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 
 /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
-extern "system" fn is_complete(this: Array, index: u32) -> bool {
+extern "win64" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
 }
 
@@ -709,7 +762,7 @@ impl Status {
     }
 }
 
-extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
+extern "win64" fn enqueue_request(this: QueueRef, request: *const Request) {
     // SAFETY: the title passes its request (null tolerated).
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
@@ -717,7 +770,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     queue(this, Command::Read(request));
 }
 
-extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+extern "win64" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     // SAFETY: the title passes an array we created (null tolerated).
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
@@ -763,7 +816,7 @@ fn queue(this: QueueRef, command: Command) {
     }
 }
 
-extern "system" fn submit(this: QueueRef) {
+extern "win64" fn submit(this: QueueRef) {
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -779,7 +832,7 @@ extern "system" fn submit(this: QueueRef) {
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
 /// finished. Grand Theft Auto VI calls this, not `Release`.
-extern "system" fn close(this: QueueRef) {
+extern "win64" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
@@ -928,7 +981,11 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        #[cfg(windows)]
+        let read = file.seek_read(&mut out[done..], request.offset + done as u64);
+        #[cfg(target_os = "linux")]
+        let read = file.read_at(&mut out[done..], request.offset + done as u64);
+        match read {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -966,6 +1023,15 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
+    into_pages(pages, offset, len, fill)
+}
+
+fn into_pages(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+) -> Result<(), HRESULT> {
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -1007,7 +1073,6 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -1025,8 +1090,8 @@ mod tests {
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+        let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain([0]).collect();
+        let open: extern "win64" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
             call(factory(), 0x20);
         let mut file = std::ptr::null_mut();
         assert_eq!(
@@ -1037,7 +1102,7 @@ mod tests {
     }
 
     fn status_array(capacity: u32) -> *mut c_void {
-        let create: extern "system" fn(
+        let create: extern "win64" fn(
             *mut c_void,
             u32,
             *const c_char,
@@ -1054,7 +1119,7 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+        let create: extern "win64" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
@@ -1091,28 +1156,28 @@ mod tests {
     }
 
     fn enqueue(queue: *mut c_void, request: &Request) {
-        let f: extern "system" fn(*mut c_void, *const Request) = call(queue, 0x18);
+        let f: extern "win64" fn(*mut c_void, *const Request) = call(queue, 0x18);
         f(queue, request);
     }
 
     fn enqueue_status(queue: *mut c_void, array: *mut c_void, index: u32) {
-        let f: extern "system" fn(*mut c_void, *mut c_void, u32) = call(queue, 0x20);
+        let f: extern "win64" fn(*mut c_void, *mut c_void, u32) = call(queue, 0x20);
         f(queue, array, index);
     }
 
     fn void(object: *mut c_void, slot: usize) {
-        let f: extern "system" fn(*mut c_void) = call(object, slot);
+        let f: extern "win64" fn(*mut c_void) = call(object, slot);
         f(object);
     }
 
     fn result(array: *mut c_void, index: u32) -> HRESULT {
-        let f: extern "system" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
+        let f: extern "win64" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
         f(array, index)
     }
 
     /// Polls as the title does, then returns the entry's result.
     fn wait(array: *mut c_void, index: u32) -> HRESULT {
-        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
+        let done: extern "win64" fn(*mut c_void, u32) -> bool = call(array, 0x18);
         let start = Instant::now();
         while !done(array, index) {
             assert!(start.elapsed() < Duration::from_secs(10), "never completed");
@@ -1232,7 +1297,7 @@ mod tests {
     #[test]
     fn half_a_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+        let create: extern "win64" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type: 0,
@@ -1442,6 +1507,7 @@ mod tests {
         assert_eq!(out, [0; 16]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn physical_page_destinations() {
         use crate::modules::xmem;
@@ -1484,6 +1550,7 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    #[cfg(windows)]
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;

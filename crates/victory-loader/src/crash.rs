@@ -26,9 +26,10 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
+pub(crate) use crate::crash_log::MAX_FRAMES;
+use crate::crash_log::Report;
+
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-/// Frames listed per report.
-pub(crate) const MAX_FRAMES: usize = 40;
 
 /// Memory saved to files when a crash is reported: (address, length, file).
 #[cfg(feature = "diagnostics")]
@@ -40,72 +41,6 @@ static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> =
 #[cfg(feature = "diagnostics")]
 pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
-}
-
-/// The file crash reports are appended to, besides being printed.
-static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-/// Also appends every unhandled-exception report and panic to `file`, so a
-/// crash can be read after the console is gone.
-pub fn log_crashes_to(file: std::path::PathBuf) {
-    if LOG.set(file).is_ok() {
-        let print = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            print(info);
-            append_to_log(&format!(
-                "VIctory: panic on thread {:?}: {info}\n{}",
-                std::thread::current().name().unwrap_or("?"),
-                title_output()
-            ));
-        }));
-    }
-}
-
-/// Appends a failure that is not an exception (the host GPU's) to the crash
-/// log, with the title's last debug output, and prints it.
-pub fn log_crash(text: &str) {
-    let text = format!("{text}
-{}", title_output());
-    eprint!("{text}");
-    append_to_log(&text);
-}
-
-fn append_to_log(text: &str) {
-    use std::io::Write;
-    let Some(file) = LOG.get() else { return };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
-    }
-}
-
-/// The title's last lines of debug output, kept for crash reports.
-static SAID: std::sync::Mutex<std::collections::VecDeque<String>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
-const SAID_LINES: usize = 8;
-
-/// Keeps a line of the title's debug output for the next crash report.
-pub fn note_title_output(line: &str) {
-    if line.is_empty() {
-        return;
-    }
-    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-    if said.len() == SAID_LINES {
-        said.pop_front();
-    }
-    said.push_back(line.to_owned());
-}
-
-/// The kept lines, one per report line; nothing if another thread holds
-/// them (it may be the one that faulted).
-fn title_output() -> String {
-    let Ok(said) = SAID.try_lock() else {
-        return String::new();
-    };
-    said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
 /// Installs the handlers; call once before running title code.
@@ -446,16 +381,17 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     let code = record.ExceptionCode;
     let at = record.ExceptionAddress as usize;
     let p = record.ExceptionInformation;
-    let detail = if code == EXCEPTION_ACCESS_VIOLATION {
+    let count = (record.NumberParameters as usize).min(p.len());
+    let detail = if code == EXCEPTION_ACCESS_VIOLATION && count >= 2 {
         let kind = match p[0] {
             0 => "read",
             1 => "write",
             _ => "execute",
         };
         format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1]))
-    } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
+    } else if code == CPP_EXCEPTION && count >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
-        format!(" (C++ {} thrown)", unsafe { thrown(&p) })
+        format!(" (C++ {} thrown)", unsafe { thrown(&p[..count]) })
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
         // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
         format!(" (code {})", unsafe { instruction_bytes(at) })
@@ -464,48 +400,17 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     };
     // Printed line by line (a fault while unwinding must not lose the
     // lines before it), and kept for the file.
-    let mut text = String::new();
-    let mut line = |l: String| {
-        eprintln!("{l}");
-        text.push_str(&l);
-        text.push('\n');
-    };
-    line(format!(
-        "VIctory: {what} {:#010x} at {}{detail}",
-        code as u32,
-        locate(at)
-    ));
-    line(format!(
-        "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
-        context.Rax,
-        context.Rbx,
-        context.Rcx,
-        context.Rdx,
-        context.Rsi,
-        context.Rdi,
-        context.Rsp,
-        context.Rbp
-    ));
-    line(format!(
-        "  r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
-        context.R8,
-        context.R9,
-        context.R10,
-        context.R11,
-        context.R12,
-        context.R13,
-        context.R14,
-        context.R15
-    ));
+    let mut report = Report::default();
+    report.line(format!("VIctory: {what} {code:#010x} at {}{detail}", locate(at)));
+    let c = context;
+    report.registers(&[
+        c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12,
+        c.R13, c.R14, c.R15,
+    ]);
     for (i, pc) in unwind(*context).into_iter().enumerate() {
-        line(format!("  #{i:<2} {}", locate(pc as usize)));
+        report.line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
-    if to_file {
-        let said = title_output();
-        eprint!("{said}");
-        text.push_str(&said);
-        append_to_log(&text);
-    }
+    report.finish(to_file);
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
         // SAFETY: the caller of `save_on_crash` named readable memory.

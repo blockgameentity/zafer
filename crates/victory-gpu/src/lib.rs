@@ -15,44 +15,39 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(windows, feature = "diagnostics"))]
+// The `windows` crate's D3D12 and DXGI bindings, generated for Linux.
+#[cfg(not(windows))]
+extern crate victory_windows as windows;
+
+#[cfg(feature = "diagnostics")]
 mod capture;
 pub mod console;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 mod copystat;
 pub mod descriptor;
 pub mod device;
-#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
-#[cfg(windows)]
 mod host;
-#[cfg(windows)]
 mod indirect;
+#[cfg(not(windows))]
+pub mod linux;
 pub mod list;
 pub mod object;
 pub mod pipeline;
-#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
 pub mod root;
-#[cfg(windows)]
 mod sampler;
-#[cfg(windows)]
 pub mod shader_cache;
-#[cfg(windows)]
 mod shadow;
 pub mod signature;
-#[cfg(windows)]
 mod texture;
-#[cfg(windows)]
 mod watch;
 
-#[cfg(windows)]
 pub use host::on_failure;
-#[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};

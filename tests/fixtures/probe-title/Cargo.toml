@@ -1,0 +1,20 @@
+# A DLL the hle-probe "title" ships beside it, for victory-loader's Linux
+# tests (on Windows they use a renamed system DLL). No CRT and no std, so it
+# imports nothing. NOT a workspace member: built on demand like hle-probe.
+[package]
+name = "probe-title"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# LTO leaves out the parts of libcore that would want a CRT.
+[profile.dev]
+panic = "abort"
+lto = true
+opt-level = 1
+
+[workspace]

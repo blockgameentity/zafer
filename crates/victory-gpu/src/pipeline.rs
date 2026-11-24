@@ -61,7 +61,6 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
-    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -86,7 +85,6 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
-                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
@@ -94,19 +92,24 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 }
 
 /// A translated shader and the console resources its code reads.
-#[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
-#[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dir).join(format!("{}.{}", self.hash, self.stage)),
+                        &self.container,
+                    );
+                }
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -129,7 +132,6 @@ impl Shader {
     }
 }
 
-#[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
@@ -161,7 +163,6 @@ struct Pipeline {
     bound: std::sync::atomic::AtomicBool,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
-    #[cfg(windows)]
     host: Arc<make::Pending>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
@@ -193,7 +194,6 @@ pub(crate) fn bound(this: This) {
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
-#[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
@@ -202,18 +202,17 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 }
 
 /// Host pipelines queued and not made yet.
-#[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -233,7 +232,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -249,14 +248,14 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn note_drop(this: This) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
@@ -272,14 +271,14 @@ pub(crate) fn note_drop(this: This) {
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
@@ -302,19 +301,16 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
-    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    graphics: Option<Box<host::GraphicsState>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
-    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
-    #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
-        #[cfg(windows)]
         host,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
@@ -323,7 +319,7 @@ fn hand_out(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_graphics(
+pub(crate) extern "win64" fn create_graphics(
     _: This,
     desc: *const GraphicsHead,
     iid: *const Iid,
@@ -337,7 +333,6 @@ pub(crate) extern "system" fn create_graphics(
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
     hand_out(
         shaders,
-        #[cfg(windows)]
         None,
         iid,
         out,
@@ -345,7 +340,7 @@ pub(crate) extern "system" fn create_graphics(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_compute(
+pub(crate) extern "win64" fn create_compute(
     _: This,
     desc: *const ComputeHead,
     iid: *const Iid,
@@ -357,7 +352,6 @@ pub(crate) extern "system" fn create_compute(
     };
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
-        #[cfg(windows)]
         None,
         iid,
         out,
@@ -368,7 +362,7 @@ pub(crate) extern "system" fn create_compute(
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
-pub(crate) extern "system" fn create_compute_x(
+pub(crate) extern "win64" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
     _extensions: u32,
@@ -417,7 +411,7 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
 
 /// Device method: a pipeline from a stream; the shaders are kept, and the
 /// graphics state for the host pipeline.
-pub(crate) extern "system" fn create_stream(
+pub(crate) extern "win64" fn create_stream(
     _: This,
     desc: *const StreamDesc,
     iid: *const Iid,
@@ -431,7 +425,6 @@ pub(crate) extern "system" fn create_stream(
         return E_INVALIDARG;
     }
     let mut shaders = Vec::new();
-    #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
     let mut at = 0;
     while at + 8 <= desc.size {
@@ -450,7 +443,6 @@ pub(crate) extern "system" fn create_stream(
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
             shaders.extend(copy(stage, code));
         }
-        #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
             graphics.read(kind, desc.stream.add(at))
@@ -459,18 +451,17 @@ pub(crate) extern "system" fn create_stream(
     }
     hand_out(
         shaders,
-        #[cfg(windows)]
         Some(Box::new(graphics)),
         iid,
         out,
     )
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
@@ -483,29 +474,24 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(windows)]
 pub(crate) mod host;
-#[cfg(windows)]
 mod library;
-#[cfg(windows)]
 mod make;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
-#[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
 /// Saves the pipeline cache now if anything was added (at the end of a run).
-#[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -565,7 +551,7 @@ mod tests {
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
@@ -611,7 +597,6 @@ mod tests {
         let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
-        #[cfg(windows)]
         {
             let g = pipeline(p).host.graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);

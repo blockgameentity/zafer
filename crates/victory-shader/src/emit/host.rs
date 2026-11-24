@@ -6,6 +6,7 @@ use std::ffi::CString;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
@@ -62,13 +63,67 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// `D3D12SerializeVersionedRootSignature`, from the host D3D12.
+///
+/// # Safety
+///
+/// `desc` points at live arrays.
+pub unsafe fn serialize(
+    desc: &D3D12_VERSIONED_ROOT_SIGNATURE_DESC,
+    blob: &mut Option<ID3DBlob>,
+    error: &mut Option<ID3DBlob>,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    // SAFETY: the caller's description.
+    let r = unsafe { D3D12SerializeVersionedRootSignature(desc, blob, Some(error)) };
+    #[cfg(not(windows))]
+    // SAFETY: as above; `Option<ID3DBlob>` is a nullable interface pointer.
+    let r = windows::core::HRESULT(unsafe {
+        crate::hostlib::serialize_versioned_root_signature(
+            (&raw const *desc).cast(),
+            (&raw mut *blob).cast(),
+            (&raw mut *error).cast(),
+        )
+    }?)
+    .ok();
+    r.map_err(|e| match error.as_ref() {
+        // SAFETY: the error blob's own bytes.
+        Some(text) => unsafe {
+            String::from_utf8_lossy(std::slice::from_raw_parts(
+                text.GetBufferPointer().cast::<u8>(),
+                text.GetBufferSize(),
+            ))
+            .trim_end_matches('\0')
+            .into()
+        },
+        None => err(e),
+    })
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            #[cfg(windows)]
             let mut device: Option<ID3D12Device> = None;
+            #[cfg(not(windows))]
+            let device = {
+                if warp {
+                    return Err("no software adapter on Linux".into());
+                }
+                let mut raw = std::ptr::null_mut();
+                let hr = crate::hostlib::create_device(
+                    D3D_FEATURE_LEVEL_12_0.0,
+                    (&ID3D12Device::IID as *const windows::core::GUID).cast(),
+                    &mut raw,
+                )?;
+                windows::core::HRESULT(hr).ok().map_err(err)?;
+                // SAFETY: the device the call returned, one reference ours.
+                Some(ID3D12Device::from_raw(raw))
+            };
+            #[cfg(windows)]
             if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
@@ -197,8 +252,7 @@ impl Host {
         unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            serialize(&desc, &mut blob, &mut error)?;
             let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
             let bytes = std::slice::from_raw_parts(
                 blob.GetBufferPointer().cast::<u8>(),

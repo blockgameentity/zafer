@@ -12,11 +12,21 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! Linux has no write watch: the region table guards every block (64 KiB)
+//! a copy took the same way, private memory and views alike, and keeps the
+//! blocks showing the same physical pages guarded together
+//! (`victory_loader::linux::vm::guard`, `watch`); there the runtime's
+//! remappings need no word from it.
+//!
+//! shortcut (Windows): writes into physical pages through another view
+//! (xmem's `write_physical`, DirectStorage's page destinations) are not
+//! seen at the guarded addresses; they go to the texture pool, whose
+//! textures are hashed, not guarded. Either OS: a system call writing into
+//! a guarded block fails, unless the runtime opened it first
+//! ([`writing`]).
+
+// The guards here serve Windows' answers only.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -49,46 +59,23 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
-    };
+    let pages = written_since(&mut j.found, first, last, guarded)?;
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
+        #[cfg(not(windows))]
+        add(C::GuardFaults, victory_loader::linux::watch::take_faults());
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in pages {
         j.written.insert(page, now);
     }
     Some((
@@ -98,6 +85,40 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Pages `[first, last)` written since the last asking (by anyone), as
+/// page numbers; `found` is room for the kernel's answer.
+#[cfg(not(windows))]
+fn written_since(_: &mut Vec<usize>, first: usize, last: usize, guarded: bool) -> Option<Vec<usize>> {
+    const _: () = assert!(PAGE == victory_loader::linux::watch::BLOCK);
+    victory_loader::linux::vm::guard(first * PAGE, last * PAGE, guarded)
+}
+
+#[cfg(windows)]
+fn written_since(found: &mut Vec<usize>, first: usize, last: usize, guarded: bool) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    found.resize(count.max(found.len()), 0);
+    let mut granularity = 0;
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return if guarded { guard(first * PAGE, last * PAGE) } else { None };
+    }
+    let mut pages: Vec<usize> = found[..count].iter().map(|&at| at / PAGE).collect();
+    pages.dedup();
+    Some(pages)
 }
 
 /// Guarded blocks of view memory.
@@ -122,6 +143,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(windows)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -157,6 +179,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
 /// block by block if they span views, leaving out any that fail (unmapped).
+#[cfg(windows)]
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
@@ -188,6 +211,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
+#[cfg(windows)]
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
@@ -211,7 +235,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
+    #[cfg(windows)]
     open(&mut guards(), at, at.saturating_add(len));
+    #[cfg(not(windows))]
+    victory_loader::linux::watch::open(at, len);
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -231,6 +258,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
+#[cfg(windows)]
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -271,6 +299,7 @@ fn install() {
 }
 
 /// Whether `at` is committed read-write memory now.
+#[cfg(windows)]
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
@@ -282,7 +311,7 @@ fn writable(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{

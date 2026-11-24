@@ -115,9 +115,7 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
-    #[cfg(windows)]
     host: Option<crate::host::HostList>,
-    #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
@@ -125,7 +123,6 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
-#[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
@@ -134,7 +131,6 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
 }
 
 /// The host list behind a title list, if there is a host GPU.
-#[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
@@ -143,7 +139,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
-pub(crate) extern "system" fn create_allocator(
+pub(crate) extern "win64" fn create_allocator(
     _: This,
     kind: u32,
     iid: *const Iid,
@@ -157,7 +153,7 @@ pub(crate) extern "system" fn create_allocator(
 }
 
 /// Lists start open, as in D3D12.
-pub(crate) extern "system" fn create_list(
+pub(crate) extern "win64" fn create_list(
     _: This,
     _nodes: u32,
     kind: u32,
@@ -180,7 +176,7 @@ pub(crate) struct ListDesc {
     barrier_batch: u32,
 }
 
-pub(crate) extern "system" fn create_list_x(
+pub(crate) extern "win64" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
@@ -215,7 +211,6 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
-        #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
@@ -223,42 +218,40 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
                 None
             }
         }),
-        #[cfg(windows)]
         state: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
 
-extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ALLOCATOR_IIDS).then_some(this);
     object::answer(ALLOCATOR, iid, found, out)
 }
-extern "system" fn allocator_release(this: This) -> u32 {
+extern "win64" fn allocator_release(this: This) -> u32 {
     object::release_boxed::<Allocator>(this)
 }
 /// Nothing is recorded, so there is nothing to free.
-extern "system" fn allocator_reset(_: This) -> HRESULT {
+extern "win64" fn allocator_reset(_: This) -> HRESULT {
     S_OK
 }
 
-extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
-extern "system" fn list_release(this: This) -> u32 {
+extern "win64" fn list_release(this: This) -> u32 {
     object::release_boxed::<List>(this)
 }
-extern "system" fn list_type(this: This) -> u32 {
+extern "win64" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
-extern "system" fn close(this: This) -> HRESULT {
-    #[cfg(windows)]
+extern "win64" fn close(this: This) -> HRESULT {
     if let Some(host) = host_list(this) {
         host.close();
     }
     S_OK
 }
-extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+extern "win64" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -266,13 +259,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
-    #[cfg(not(windows))]
-    let _ = (this, pipeline);
     S_OK
 }
 
@@ -291,7 +281,6 @@ pub(crate) struct Barrier {
 
 /// The barrier on host resources, or `None` if it names a resource the host
 /// GPU does not have (buffers so far).
-#[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
     let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
@@ -350,8 +339,7 @@ const UAV_BARRIER: Barrier = Barrier {
 };
 
 /// Returns the console's barrier "actions" (none).
-extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
-    #[cfg(windows)]
+extern "win64" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -387,7 +375,6 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
-#[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
@@ -398,13 +385,10 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
-#[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
-#[cfg(windows)]
 const COPY_SOURCE: u32 = 0x800;
 
 /// `len` bytes at `offset` of a title buffer, if they are inside it.
-#[cfg(windows)]
 fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     let (data, size) = crate::resource::buffer_bytes(buffer)?;
     let end = offset.checked_add(len)?;
@@ -417,7 +401,7 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
-extern "system" fn copy_buffer_region(
+extern "win64" fn copy_buffer_region(
     this: This,
     dst: This,
     dst_offset: u64,
@@ -425,19 +409,15 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
-    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
-extern "system" fn copy_resource(this: This, dst: This, src: This) {
-    #[cfg(windows)]
+extern "win64" fn copy_resource(this: This, dst: This, src: This) {
     {
         let Some(list) = host_list(this) else {
             return;
@@ -463,11 +443,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, src);
 }
 
-extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+extern "win64" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
 }
 
@@ -484,7 +462,7 @@ pub(crate) struct CopyLocation {
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
-extern "system" fn copy_texture_region(
+extern "win64" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
     x: u32,
@@ -493,7 +471,6 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
-    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
@@ -588,12 +565,10 @@ extern "system" fn copy_texture_region(
             )
         };
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, x, y, z, src, source_box);
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
-extern "system" fn copy_texture_region_x(
+extern "win64" fn copy_texture_region_x(
     this: This,
     dst: *const CopyLocation,
     x: u32,
@@ -606,7 +581,7 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
-extern "system" fn resolve(
+extern "win64" fn resolve(
     this: This,
     dst: This,
     dst_sub: u32,
@@ -614,7 +589,6 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
-    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -663,8 +637,6 @@ extern "system" fn resolve(
             }
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
 #[repr(C)]
@@ -675,14 +647,13 @@ pub(crate) struct Rect {
     bottom: i32,
 }
 
-extern "system" fn clear_rtv(
+extern "win64" fn clear_rtv(
     this: This,
     handle: u64,
     color: *const [f32; 4],
     count: u32,
     rects: *const Rect,
 ) {
-    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -717,13 +688,11 @@ extern "system" fn clear_rtv(
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, handle, color, count, rects);
 }
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
 /// flags: 1 depth, 2 stencil.
-extern "system" fn clear_dsv(
+extern "win64" fn clear_dsv(
     this: This,
     handle: u64,
     flags: u32,
@@ -732,7 +701,6 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
-    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -758,14 +726,11 @@ extern "system" fn clear_dsv(
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
-    #[cfg(not(windows))]
-    let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
-extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
-    #[cfg(windows)]
+extern "win64" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
@@ -780,30 +745,22 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             }
         });
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, src, len);
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.
-extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
+extern "win64" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
-    #[cfg(windows)]
+extern "win64" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     state::dispatch(this, x, y, z);
-    #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+extern "win64" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -812,7 +769,7 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// by a query.
 /// shortcut: no query runs on the host GPU; results are plausible values,
 /// not measured ones (time spans come out as the submission's length).
-extern "system" fn resolve_queries(
+extern "win64" fn resolve_queries(
     this: This,
     _heap: This,
     kind: u32,
@@ -860,23 +817,20 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-extern "system" fn set_pipeline(this: This, pipeline: This) {
+extern "win64" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
-    #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
-    #[cfg(not(windows))]
-    let _ = this;
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "win64" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
-extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
+extern "win64" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
     reset(this, allocator, pipeline)
 }
 
@@ -885,7 +839,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// same address; null on failure. Grand Theft Auto VI's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
-extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
+extern "win64" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
@@ -907,11 +861,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
 /// arguments, nothing returned.
-extern "system" fn ignored_state(_: This) {}
+extern "win64" fn ignored_state(_: This) {}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
-#[cfg(windows)]
 mod state {
     use super::{This, host_list, with_state};
     use crate::draw::{IndexView, VertexView};
@@ -927,10 +880,10 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
-    pub(super) extern "system" fn topology(this: This, topology: u32) {
+    pub(super) extern "win64" fn topology(this: This, topology: u32) {
         with_state(this, |list, s| s.set_topology(list, topology));
     }
-    pub(super) extern "system" fn viewports(
+    pub(super) extern "win64" fn viewports(
         this: This,
         count: u32,
         viewports: *const D3D12_VIEWPORT,
@@ -939,35 +892,35 @@ mod state {
             crate::draw::viewports(list, items(viewports, count));
         }
     }
-    pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
+    pub(super) extern "win64" fn scissors(this: This, count: u32, rects: *const RECT) {
         if let Some(list) = host_list(this) {
             crate::draw::scissors(list, items(rects, count));
         }
     }
-    pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+    pub(super) extern "win64" fn blend_factor(this: This, factor: *const [f32; 4]) {
         if let Some(list) = host_list(this) {
             // SAFETY: the title passes four floats or null.
             crate::draw::blend_factor(list, unsafe { factor.as_ref() });
         }
     }
-    pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+    pub(super) extern "win64" fn stencil_ref(this: This, reference: u32) {
         if let Some(list) = host_list(this) {
             crate::draw::stencil_ref(list, reference);
         }
     }
-    pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+    pub(super) extern "win64" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
-    pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+    pub(super) extern "win64" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
-    pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+    pub(super) extern "win64" fn graphics_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
-    pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+    pub(super) extern "win64" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
-    pub(super) extern "system" fn graphics_constant(
+    pub(super) extern "win64" fn graphics_constant(
         this: This,
         slot: u32,
         value: u32,
@@ -975,7 +928,7 @@ mod state {
     ) {
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
-    pub(super) extern "system" fn compute_constants(
+    pub(super) extern "win64" fn compute_constants(
         this: This,
         slot: u32,
         count: u32,
@@ -986,7 +939,7 @@ mod state {
             s.set_constants(true, slot, items(values, count), offset)
         });
     }
-    pub(super) extern "system" fn graphics_constants(
+    pub(super) extern "win64" fn graphics_constants(
         this: This,
         slot: u32,
         count: u32,
@@ -998,17 +951,17 @@ mod state {
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
-    pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+    pub(super) extern "win64" fn compute_view(this: This, slot: u32, address: u64) {
         with_state(this, |_, s| s.set_view(true, slot, address));
     }
-    pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+    pub(super) extern "win64" fn graphics_view(this: This, slot: u32, address: u64) {
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
-    pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
+    pub(super) extern "win64" fn index_buffer(this: This, view: *const IndexView) {
         // SAFETY: the title passes a view or null.
         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
     }
-    pub(super) extern "system" fn vertex_buffers(
+    pub(super) extern "win64" fn vertex_buffers(
         this: This,
         start: u32,
         count: u32,
@@ -1024,7 +977,7 @@ mod state {
     }
     /// `(count, handles, one range, depth)`: with one range, the handles
     /// follow the first at the render target view size (128 bytes).
-    pub(super) extern "system" fn targets(
+    pub(super) extern "win64" fn targets(
         this: This,
         count: u32,
         handles: *const u64,
@@ -1042,7 +995,7 @@ mod state {
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
     }
-    pub(super) extern "system" fn draw(
+    pub(super) extern "win64" fn draw(
         this: This,
         vertices: u32,
         instances: u32,
@@ -1054,13 +1007,13 @@ mod state {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
-    pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+    pub(super) extern "win64" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
-    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+    pub(super) extern "win64" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1071,7 +1024,7 @@ mod state {
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
     /// are dropped; make them ExecuteIndirect when the title uses them.
-    pub(super) extern "system" fn dispatch_mesh_x(
+    pub(super) extern "win64" fn dispatch_mesh_x(
         this: This,
         x: u32,
         _flags: u64,
@@ -1086,7 +1039,7 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    pub(super) extern "system" fn draw_indexed(
+    pub(super) extern "win64" fn draw_indexed(
         this: This,
         indices: u32,
         instances: u32,
@@ -1102,31 +1055,6 @@ mod state {
 }
 
 /// Without a host GPU every draw state call is ignored.
-#[cfg(not(windows))]
-mod state {
-    pub(super) use super::dispatch;
-    pub(super) use super::draw;
-    pub(super) use super::draw as draw_indexed;
-    pub(super) use super::draw as dispatch_mesh;
-    pub(super) use super::draw as dispatch_mesh_x;
-    pub(super) use super::ignored_state as blend_factor;
-    pub(super) use super::ignored_state as compute_constant;
-    pub(super) use super::ignored_state as compute_constants;
-    pub(super) use super::ignored_state as compute_table;
-    pub(super) use super::ignored_state as compute_view;
-    pub(super) use super::ignored_state as graphics_constant;
-    pub(super) use super::ignored_state as graphics_constants;
-    pub(super) use super::ignored_state as graphics_table;
-    pub(super) use super::ignored_state as graphics_view;
-    pub(super) use super::ignored_state as heaps;
-    pub(super) use super::ignored_state as index_buffer;
-    pub(super) use super::ignored_state as scissors;
-    pub(super) use super::ignored_state as stencil_ref;
-    pub(super) use super::ignored_state as targets;
-    pub(super) use super::ignored_state as topology;
-    pub(super) use super::ignored_state as vertex_buffers;
-    pub(super) use super::ignored_state as viewports;
-}
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1135,10 +1063,6 @@ fn count_draw() {
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
-#[cfg(not(windows))]
-extern "system" fn draw(_: This) {
-    count_draw();
-}
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
@@ -1149,7 +1073,7 @@ extern "system" fn draw(_: This) {
 /// through the host's indirect execution (`State::execute_indirect`).
 /// shortcut: signatures that change root arguments are dropped (logged
 /// once per signature).
-extern "system" fn execute_indirect(
+extern "win64" fn execute_indirect(
     this: This,
     signature: This,
     max: u32,
@@ -1165,7 +1089,6 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
-    #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
@@ -1176,7 +1099,7 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(feature = "diagnostics")]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
             address.is_some(),
@@ -1210,10 +1133,6 @@ static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
-#[cfg(not(windows))]
-extern "system" fn dispatch(_: This) {
-    count_dispatch();
-}
 static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1227,15 +1146,14 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+extern "win64" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    #[cfg(windows)]
+extern "win64" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
@@ -1245,17 +1163,15 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
-extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+extern "win64" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
-extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+extern "win64" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -1270,7 +1186,6 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
     }
-    #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
@@ -1427,10 +1342,10 @@ mod tests {
         let mut same = null;
         assert_eq!(list_query(list, &LIST_IIDS[7], &mut same), S_OK);
         assert_eq!(same, list);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x10)(list), 1);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x40)(list), 0);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(list, 0x10)(list), 1);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(list, 0x40)(list), 0);
         assert_eq!(
-            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            slot::<extern "win64" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
         // List-owned upload memory: aligned, writable, gone at reset.
@@ -1442,7 +1357,7 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let release = |o: This| slot::<extern "win64" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }

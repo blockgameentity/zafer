@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -20,8 +20,12 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    #[cfg(windows)]
     let prepared = victory_loader::prepare(&original)?;
+    #[cfg(windows)]
     let hash = prepared.original_hash.to_hex();
+    #[cfg(target_os = "linux")]
+    let hash = blake3::hash(&original).to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
@@ -29,7 +33,12 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    // On Linux we map the original image ourselves; nothing is written.
+    #[cfg(windows)]
     let image = victory_loader::load(&prepared, &images)?;
+    #[cfg(target_os = "linux")]
+    let image = victory_loader::load(&original, exe)?;
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -45,8 +54,8 @@ pub fn run(
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest = std::fs::read_to_string(title_file(title_dir, "MicrosoftGame.config"))
+        .unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -59,6 +68,16 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::path::absolute(exe).unwrap_or_else(|_| exe.to_owned());
+        let dir = std::path::absolute(title_dir).unwrap_or_else(|_| title_dir.to_owned());
+        victory_loader::linux::teb::set_process_parameters(
+            &path.display().to_string(),
+            &format!("\"{}\"", path.display()),
+            &dir.display().to_string(),
+        );
+    }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
@@ -102,8 +121,14 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // Linux timers are fine-grained already.
+    #[cfg(windows)]
     victory_hle::runtime::use_console_timers();
-    #[cfg(feature = "diagnostics")]
+    // Ctrl+C, a kill or closing the window ends the title as the console
+    // ends it (on Windows, the window close is caught by its procedure).
+    #[cfg(target_os = "linux")]
+    victory_hle::modules::lifecycle::end_on_signals();
+    #[cfg(all(any(windows, target_os = "linux"), feature = "diagnostics"))]
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
@@ -127,9 +152,10 @@ pub fn run(
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(any(windows, target_os = "linux"), feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    #[cfg(windows)]
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
@@ -153,7 +179,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
 /// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(any(windows, target_os = "linux"), feature = "diagnostics"))]
 fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
@@ -179,15 +205,29 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+/// The file `name` in the title's folder: on Linux whatever its case, as
+/// Windows finds it.
+#[cfg(any(windows, target_os = "linux"))]
+fn title_file(dir: &Path, name: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    if let Some(path) = victory_loader::linux::image::find_file(dir, name) {
+        return path;
+    }
+    dir.join(name)
+}
+
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(windows)]
+/// On Linux there is no host DLL: what the title ships (`vcruntime140`,
+/// `msvcp140`, ...) is mapped unless our runtime serves it.
+#[cfg(any(windows, target_os = "linux"))]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+    let host_dll = cfg!(windows) && host.allows(dll);
+    !host_dll && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
 /// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct LateDlls {
     host: victory_hle::HostPolicy,
     title_dir: std::path::PathBuf,
@@ -198,7 +238,7 @@ struct LateDlls {
     lock: LoaderLock,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl LateDlls {
     /// Every `LoadLibrary` of the title comes here first. Returns a title
     /// image called `file`, mapping it and the title DLLs it needs first,
@@ -279,14 +319,14 @@ impl LateDlls {
 
 /// The Windows loader lock's shape: one thread at a time, re-entered by
 /// the thread that holds it.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Default)]
 struct LoaderLock {
     owner: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)>,
     free: std::sync::Condvar,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl LoaderLock {
     fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
         let me = std::thread::current().id();
@@ -309,7 +349,7 @@ impl LoaderLock {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -332,7 +372,7 @@ mod tests {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
-    anyhow::bail!("running titles requires Windows")
+    anyhow::bail!("running titles requires Windows or Linux")
 }

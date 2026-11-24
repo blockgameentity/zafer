@@ -320,7 +320,7 @@ impl LoadedImage {
     unsafe fn tls_callbacks(&self, reason: u32, reserved: *mut c_void) {
         let Some(tls) = &self.info.tls else { return };
         for &rva in &tls.callback_rvas {
-            type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
+            type TlsCallback = unsafe extern "win64" fn(*mut c_void, u32, *mut c_void);
             // SAFETY: the RVA came from the image's own TLS directory.
             let callback: TlsCallback = unsafe { std::mem::transmute(self.base() + rva as usize) };
             // SAFETY: the caller guarantees imports are bound.
@@ -373,7 +373,7 @@ impl LoadedImage {
         if !dll_main || !self.info.is_dll() || self.info.entry_rva == 0 {
             return None;
         }
-        type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
+        type DllMain = unsafe extern "win64" fn(*mut c_void, u32, *mut c_void) -> i32;
         // SAFETY: the entry RVA came from the original image header.
         let main: DllMain =
             unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };
@@ -409,7 +409,7 @@ impl LoadedImage {
                 // SAFETY: forwarded from the caller of `spawn_main`.
                 unsafe { self.run_tls_callbacks(DLL_PROCESS_ATTACH) };
                 crate::threads::attached(self.base());
-                type Entry = unsafe extern "system" fn(*mut c_void) -> u32;
+                type Entry = unsafe extern "win64" fn(*mut c_void) -> u32;
                 // SAFETY: the entry RVA came from the original image header.
                 let entry: Entry =
                     unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };

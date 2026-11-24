@@ -1,5 +1,5 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3; on Linux SDL3's, through `victory_gpu::linux`); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -273,7 +273,7 @@ impl Drop for Ref {
     }
 }
 
-type DeviceCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u32, u32);
+type DeviceCallback = extern "win64" fn(u64, *mut c_void, *const Device, u64, u32, u32);
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -387,6 +387,10 @@ impl Hub {
         let hub = Hub::new(source);
         hub.poll();
         std::thread::spawn(move || {
+            // Device callbacks are title code: this thread needs a TEB of
+            // its own, not the one inherited with its creator's GS base.
+            #[cfg(target_os = "linux")]
+            victory_loader::linux::thread::attach_current();
             loop {
                 std::thread::sleep(POLL);
                 hub.poll();
@@ -517,17 +521,7 @@ fn host() -> Box<dyn Source> {
 
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
-    struct Nothing;
-    impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
-        }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
-        }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
-    }
-    Box::new(Nothing)
+    Box::new(sdl::Host)
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
@@ -536,7 +530,7 @@ type This = *const Object;
 type Out = *mut *const c_void;
 
 /// The DLL's only export (ordinal 1): the input object, static and shared.
-pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
+pub extern "win64" fn GameInputCreate(out: *mut This) -> HRESULT {
     tracing::info!("GameInputCreate");
     if out.is_null() {
         return E_INVALIDARG;
@@ -573,20 +567,20 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
+extern "win64" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
     tracing::warn!("input QueryInterface not implemented");
     fail(out, E_NOINTERFACE)
 }
 /// The input object and devices live as long as the process.
-extern "system" fn add_ref(_: *const c_void) -> u32 {
+extern "win64" fn add_ref(_: *const c_void) -> u32 {
     1
 }
 
-extern "system" fn timestamp(_: This) -> u64 {
+extern "win64" fn timestamp(_: This) -> u64 {
     now()
 }
 
-extern "system" fn current_reading(
+extern "win64" fn current_reading(
     this: This,
     kind: u32,
     device: *const Device,
@@ -668,7 +662,7 @@ fn relative(
     };
     hand(out, found)
 }
-extern "system" fn next_reading(
+extern "win64" fn next_reading(
     this: This,
     reference: *const Reading,
     kind: u32,
@@ -677,7 +671,7 @@ extern "system" fn next_reading(
 ) -> HRESULT {
     relative(this, reference, kind, device, out, true)
 }
-extern "system" fn previous_reading(
+extern "win64" fn previous_reading(
     this: This,
     reference: *const Reading,
     kind: u32,
@@ -687,7 +681,7 @@ extern "system" fn previous_reading(
     relative(this, reference, kind, device, out, false)
 }
 /// The device's reading at `time`, among those still kept.
-extern "system" fn temporal_reading(
+extern "win64" fn temporal_reading(
     this: This,
     time: u64,
     device: *const Device,
@@ -714,7 +708,7 @@ fn token(out: *mut u64) -> HRESULT {
 
 // shortcut: reading callbacks never run; Grand Theft Auto VI registers none
 // (it polls).
-extern "system" fn register_reading(
+extern "win64" fn register_reading(
     _: This,
     _device: *const c_void,
     _kind: u32,
@@ -731,7 +725,7 @@ extern "system" fn register_reading(
 /// Enumeration reports the devices already there: blocking on the caller's
 /// thread before we return (the title registers holding a lock its callback
 /// takes again), asynchronous on the next poll.
-extern "system" fn register_device(
+extern "win64" fn register_device(
     this: This,
     device: *const Device,
     kind: u32,
@@ -782,7 +776,7 @@ extern "system" fn register_device(
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
-extern "system" fn register_other(
+extern "win64" fn register_other(
     _: This,
     _device: *const c_void,
     _context: *mut c_void,
@@ -797,13 +791,13 @@ fn forget(this: This, token: u64) {
     state.callbacks.retain(|r| r.token != token);
     state.pending.retain(|e| e.registration.token != token);
 }
-extern "system" fn stop_callback(this: This, token: u64) {
+extern "win64" fn stop_callback(this: This, token: u64) {
     forget(this, token);
 }
 /// Stops the callback, then waits up to `timeout` µs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
-extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
+extern "win64" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
     forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
@@ -831,15 +825,15 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
 }
 
 /// Dispatcher and aggregate device: no title of ours asks for them.
-extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
+extern "win64" fn create_dispatcher(_: This, out: Out) -> HRESULT {
     tracing::warn!("input dispatcher not implemented");
     fail(out, E_NOTIMPL)
 }
-extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
+extern "win64" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
     tracing::warn!("aggregate input device not implemented");
     fail(out, E_NOTIMPL)
 }
-extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
+extern "win64" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
     if id.is_null() || out.is_null() {
         return fail(out, E_INVALIDARG);
     }
@@ -856,10 +850,10 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
 }
 /// Lookup by object, platform handle or platform string: our devices have
 /// none of these.
-extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
+extern "win64" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
     fail(out, DEVICE_NOT_FOUND)
 }
-extern "system" fn enable_oem_device(
+extern "win64" fn enable_oem_device(
     _: This,
     _vendor: u16,
     _product: u16,
@@ -868,7 +862,7 @@ extern "system" fn enable_oem_device(
 ) -> HRESULT {
     S_OK
 }
-extern "system" fn set_focus_policy(_: This, _policy: u32) {}
+extern "win64" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
     no_interface as *const (),        // 0x00
@@ -895,11 +889,11 @@ static INPUT: Table<22> = Table([
     set_focus_policy as *const (),    // 0xa8
 ]);
 
-extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
+extern "win64" fn device_info(this: *const Device) -> *const DeviceInfo {
     // SAFETY: one of our devices.
     unsafe { &(*this).info }
 }
-extern "system" fn device_status(this: *const Device) -> u32 {
+extern "win64" fn device_status(this: *const Device) -> u32 {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.hub().state().slots[device.index].connected {
@@ -912,7 +906,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
 // diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
-extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
+extern "win64" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
@@ -927,7 +921,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
-extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
+extern "win64" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
         "input device method not implemented"
@@ -963,10 +957,10 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     // SAFETY: a reading we handed out and the title still holds.
     unsafe { &*this }
 }
-extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
+extern "win64" fn reading_add_ref(this: *const Reading) -> u32 {
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
-extern "system" fn reading_release(this: *const Reading) -> u32 {
+extern "win64" fn reading_release(this: *const Reading) -> u32 {
     let left = reading(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: the last reference is gone; `Ref::new` boxed it.
@@ -974,10 +968,10 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
     }
     left
 }
-extern "system" fn input_kind(this: *const Reading) -> u32 {
+extern "win64" fn input_kind(this: *const Reading) -> u32 {
     reading(this).kind()
 }
-extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
+extern "win64" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     let reading = reading(this);
     if reading.kind() & kind != 0 {
         reading.sequence
@@ -985,22 +979,22 @@ extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
         0
     }
 }
-extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
+extern "win64" fn reading_timestamp(this: *const Reading) -> u64 {
     reading(this).timestamp
 }
-extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
+extern "win64" fn reading_device(this: *const Reading, out: *mut *const Device) {
     if !out.is_null() {
         // SAFETY: checked non-null; devices need no reference.
         unsafe { out.write(reading(this).device) };
     }
 }
-extern "system" fn key_count(this: *const Reading) -> u32 {
+extern "win64" fn key_count(this: *const Reading) -> u32 {
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
         Value::Pad(_) => 0,
     }
 }
-extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
+extern "win64" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
     let Value::Keys(keys) = &reading(this).value else {
         return 0;
     };
@@ -1012,7 +1006,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
     n as u32
 }
-extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+extern "win64" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
@@ -1023,7 +1017,7 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
     }
 }
 /// Kinds our devices do not have: no count, no state.
-extern "system" fn nothing(_: *const c_void) -> usize {
+extern "win64" fn nothing(_: *const c_void) -> usize {
     0
 }
 
@@ -1065,6 +1059,45 @@ pub(crate) fn module() -> HleModule {
             address: GameInputCreate as *const () as usize,
         }],
     }
+}
+
+/// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+/// 0.2 s that long after input starts, with or without focus. A key is a
+/// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+/// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+#[cfg(feature = "diagnostics")]
+fn scripted() -> Vec<u8> {
+    static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        let keys = list.split(',').filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                vk,
+            ))
+        });
+        (Instant::now(), keys.collect())
+    });
+    let (start, keys) = &*SCRIPT;
+    let now = start.elapsed();
+    keys.iter()
+        .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        .map(|&(_, vk)| vk)
+        .collect()
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
@@ -1149,7 +1182,7 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
+            let mut down = super::scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             if focused() {
@@ -1184,45 +1217,6 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
-    }
-
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1253,6 +1247,147 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+}
+
+/// Host input on Linux: SDL3's gamepads and keyboard (our window's focus),
+/// from the window's SDL thread in `victory-gpu`.
+#[cfg(not(windows))]
+mod sdl {
+    use victory_gpu::linux;
+
+    use super::*;
+
+    /// `SDL_GamepadButton` (the bit `linux::Pad` sets) and ours.
+    const BUTTONS: [(u32, u32); 14] = [
+        (6, MENU),            // start
+        (4, VIEW),            // back
+        (0, A),               // south
+        (1, B),               // east
+        (2, X),               // west
+        (3, Y),               // north
+        (11, UP),             // d-pad
+        (12, DOWN),
+        (13, LEFT),
+        (14, RIGHT),
+        (9, LEFT_SHOULDER),
+        (10, RIGHT_SHOULDER),
+        (7, LEFT_STICK),
+        (8, RIGHT_STICK),
+    ];
+
+    /// Raw values, no dead zone: titles apply their own. SDL's sticks
+    /// are down positive, the console's up positive.
+    pub(super) fn convert(pad: &linux::Pad) -> PadState {
+        let stick = |v: i16| (f32::from(v) / 32767.0).clamp(-1.0, 1.0);
+        let trigger = |v: i16| (f32::from(v) / 32767.0).clamp(0.0, 1.0);
+        PadState {
+            buttons: BUTTONS
+                .iter()
+                .filter(|(host, _)| pad.buttons & 1 << host != 0)
+                .fold(0, |all, (_, bit)| all | bit),
+            left_trigger: trigger(pad.axes[4]),
+            right_trigger: trigger(pad.axes[5]),
+            left_x: stick(pad.axes[0]),
+            left_y: -stick(pad.axes[1]),
+            right_x: stick(pad.axes[2]),
+            right_y: -stick(pad.axes[3]),
+        }
+    }
+
+    /// SDL scan code (USB usage) → virtual key and scan code (0xE0xx when
+    /// extended), for the keys a pad stand-in and menus use.
+    pub(super) fn key(usage: u16) -> Option<(u8, u32)> {
+        /// Set-1 scan codes of A to Z.
+        const LETTERS: [u32; 26] = [
+            0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
+            0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+        ];
+        Some(match usage {
+            4..=29 => (b'A' + (usage - 4) as u8, LETTERS[usize::from(usage - 4)]),
+            30..=38 => (b'1' + (usage - 30) as u8, 2 + u32::from(usage - 30)),
+            39 => (b'0', 0x0B),
+            40 => (0x0D, 0x1C), // Enter
+            41 => (0x1B, 0x01), // Esc
+            42 => (0x08, 0x0E), // Backspace
+            43 => (0x09, 0x0F), // Tab
+            44 => (0x20, 0x39), // Space
+            58..=67 => (0x70 + (usage - 58) as u8, 0x3B + u32::from(usage - 58)), // F1-F10
+            68 => (0x7A, 0x57),
+            69 => (0x7B, 0x58),
+            79 => (0x27, 0xE04D), // Right
+            80 => (0x25, 0xE04B), // Left
+            81 => (0x28, 0xE050), // Down
+            82 => (0x26, 0xE048), // Up
+            224 => (0xA2, 0x1D),   // left Ctrl
+            225 => (0xA0, 0x2A),   // left Shift
+            226 => (0xA4, 0x38),   // left Alt
+            228 => (0xA3, 0xE01D), // right Ctrl
+            229 => (0xA1, 0x36),   // right Shift
+            230 => (0xA5, 0xE038), // right Alt
+            _ => return None,
+        })
+    }
+
+    pub(super) struct Host;
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            linux::pad(slot).map(|p| convert(&p))
+        }
+
+        fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
+            let scripted = super::scripted()
+                .into_iter()
+                .filter_map(|vk| (0..=230).filter_map(key).find(|&(v, _)| v == vk));
+            #[cfg(not(feature = "diagnostics"))]
+            let scripted = std::iter::empty();
+            linux::keys()
+                .into_iter()
+                .filter_map(key)
+                .chain(scripted)
+                .map(|(virtual_key, scan_code)| KeyState {
+                    scan_code,
+                    virtual_key,
+                    // shortcut: no characters, as on Windows.
+                    ..Default::default()
+                })
+                .collect()
+        }
+
+        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            linux::rumble(slot, low, high);
+        }
+    }
+
+    #[test]
+    fn host_pads_convert_to_console_pads() {
+        let pad = linux::Pad {
+            buttons: 1 << 0 | 1 << 6 | 1 << 13,
+            axes: [-32768, -32767, 0, 0, 32767, 0],
+        };
+        let state = convert(&pad);
+        assert_eq!(state.buttons, A | MENU | LEFT);
+        assert_eq!(
+            (state.left_trigger, state.left_x, state.left_y, state.right_x),
+            (1.0, -1.0, 1.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn keys_map_to_the_stand_in_pads_keys() {
+        assert_eq!(key(26), Some((b'W', 0x11)));
+        assert_eq!(key(4), Some((b'A', 0x1E)));
+        assert_eq!(key(30), Some((b'1', 0x02)));
+        assert_eq!(key(82), Some((0x26, 0xE048)));
+        // Every key of the stand-in pad is reachable.
+        for (vk, _) in FALLBACK_BUTTONS {
+            assert!((0..512).filter_map(key).any(|(k, _)| k == vk), "{vk:#x}");
+        }
+        for vk in *b"WASDIJKLZC" {
+            assert!((0..512).filter_map(key).any(|(k, _)| k == vk), "{vk:#x}");
+        }
     }
 }
 
@@ -1312,7 +1447,7 @@ mod tests {
     /// Device callbacks seen: device index, current and previous status.
     type Log = Mutex<Vec<(usize, u32, u32)>>;
 
-    extern "system" fn record(
+    extern "win64" fn record(
         _token: u64,
         context: *mut c_void,
         device: *const Device,
@@ -1326,7 +1461,7 @@ mod tests {
     }
 
     fn register(hub: &Hub, kind: u32, enumeration: u32, log: &Log) -> u64 {
-        type Register = extern "system" fn(
+        type Register = extern "win64" fn(
             This,
             *const Device,
             u32,
@@ -1364,7 +1499,7 @@ mod tests {
     }
 
     fn current(hub: &Hub, kind: u32, device: usize) -> Result<*const Reading, HRESULT> {
-        type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
+        type Current = extern "win64" fn(This, u32, *const Device, Out) -> HRESULT;
         let mut out = std::ptr::null();
         let hr = slot::<Current, _>(&hub.object, 0x20)(
             &hub.object,
@@ -1376,7 +1511,7 @@ mod tests {
     }
 
     fn walk(hub: &Hub, offset: usize, from: *const Reading) -> Result<*const Reading, HRESULT> {
-        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        type Walk = extern "win64" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
         let mut out = std::ptr::null();
         let device = reading(from).device;
         let hr =
@@ -1387,19 +1522,19 @@ mod tests {
     fn pad(reading: *const Reading) -> PadState {
         let mut state = PadState::default();
         let get =
-            slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(reading, 0xb0);
+            slot::<extern "win64" fn(*const Reading, *mut PadState) -> bool, _>(reading, 0xb0);
         assert!(get(reading, &mut state));
         state
     }
 
     fn stamp(reading: *const Reading) -> (u64, u64) {
-        let time = slot::<extern "system" fn(*const Reading) -> u64, _>(reading, 0x28);
-        let sequence = slot::<extern "system" fn(*const Reading, u32) -> u64, _>(reading, 0x20);
+        let time = slot::<extern "win64" fn(*const Reading) -> u64, _>(reading, 0x28);
+        let sequence = slot::<extern "win64" fn(*const Reading, u32) -> u64, _>(reading, 0x20);
         (time(reading), sequence(reading, GAMEPAD_KIND))
     }
 
     fn release(reading: *const Reading) {
-        slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
+        slot::<extern "win64" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
     }
 
     #[test]
@@ -1484,9 +1619,9 @@ mod tests {
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
+        let count = slot::<extern "win64" fn(*const Reading) -> u32, _>(r, 0x70);
         let state =
-            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
+            slot::<extern "win64" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
         assert_eq!(count(r), 4);
         let mut got = [KeyState::default(); 8];
         assert_eq!(state(r, 8, got.as_mut_ptr()), 4);
@@ -1518,7 +1653,7 @@ mod tests {
         hub.poll();
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
 
-        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+        let unregister = slot::<extern "win64" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(unregister(&hub.object, token, 5000));
         host.lock().unwrap().pads[0] = Some(PadState::default());
         hub.poll();
@@ -1531,7 +1666,7 @@ mod tests {
         static INSIDE: AtomicBool = AtomicBool::new(false);
         static LEAVE: AtomicBool = AtomicBool::new(false);
         static FROM_INSIDE: AtomicU32 = AtomicU32::new(0);
-        extern "system" fn slow(
+        extern "win64" fn slow(
             token: u64,
             context: *mut c_void,
             _: *const Device,
@@ -1540,7 +1675,7 @@ mod tests {
             _: u32,
         ) {
             // From inside its own callback, unregistering fails at once.
-            let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(context, 0x68);
+            let unregister = slot::<extern "win64" fn(This, u64, u64) -> bool, _>(context, 0x68);
             if !unregister(context.cast(), token, 0) {
                 FROM_INSIDE.fetch_add(1, Ordering::SeqCst);
             }
@@ -1550,7 +1685,7 @@ mod tests {
             }
         }
         let (hub, host) = fake();
-        type Register = extern "system" fn(
+        type Register = extern "win64" fn(
             This,
             *const Device,
             u32,
@@ -1572,7 +1707,7 @@ mod tests {
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+        let unregister = slot::<extern "win64" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
@@ -1592,12 +1727,12 @@ mod tests {
         host.lock().unwrap().pads[2] = Some(PadState::default());
         hub.poll();
         let device = &hub.devices[2] as *const Device;
-        let info = slot::<extern "system" fn(*const Device) -> *const u8, _>(device, 0x18);
+        let info = slot::<extern "win64" fn(*const Device) -> *const u8, _>(device, 0x18);
         // SAFETY: the info has the id at +0x20.
         let id = unsafe { *(info(device).add(0x20) as *const [u8; 32]) };
         assert_ne!(id, [0; 32]);
 
-        type Find = extern "system" fn(This, *const [u8; 32], Out) -> HRESULT;
+        type Find = extern "win64" fn(This, *const [u8; 32], Out) -> HRESULT;
         let find = slot::<Find, _>(&hub.object, 0x80);
         let mut out = std::ptr::null();
         assert_eq!(find(&hub.object, &id, &mut out), S_OK);
@@ -1605,7 +1740,7 @@ mod tests {
         assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
         assert!(out.is_null());
 
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        type Rumble = extern "win64" fn(*const Device, *const [f32; 4]);
         let rumble = slot::<Rumble, _>(device, 0x50);
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);

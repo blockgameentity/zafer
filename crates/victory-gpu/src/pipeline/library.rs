@@ -75,9 +75,21 @@ fn library() -> Option<&'static Mutex<Library>> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // No blob is a null pointer (vkd3d-proton refuses an empty one).
+        let at = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); one
+        // reference is ours.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                device.as_raw(),
+                at.cast(),
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut out,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(out).cast()
         }
     };
     if !blob.is_empty() {
@@ -91,7 +103,9 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = make(&[]).ok()?;
+    let library = make(&[])
+        .inspect_err(|e| tracing::warn!(error = %e, "no host pipeline library"))
+        .ok()?;
     Some(Library { library, _blob: Vec::new(), added: 0 })
 }
 

@@ -4,7 +4,8 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! the system's compiler; a 5.1 shader with its root signature inside. On
+//! Linux DXC compiles it, as 6.0, if `VICTORY_DXCOMPILER` names one).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -16,9 +17,12 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
+#[cfg(windows)]
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
@@ -92,8 +96,25 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+/// The clamp's DXIL, with its root signature, compiled once. DXC's LLVM
+/// replaces our fault handlers at its first compile (it registers its own
+/// once per process), so they are taken back right after; the device's
+/// creation compiles it, before any copy guards title memory.
+#[cfg(not(windows))]
+pub(crate) fn compiled() -> windows::core::Result<Vec<u8>> {
+    static DXIL: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    DXIL.get_or_init(|| {
+        let dxil = victory_shader::hostlib::compile_hlsl(SOURCE, "main", "cs_6_0");
+        victory_loader::linux::signals::reclaim();
+        dxil.inspect_err(|e| tracing::warn!("argument clamp: {e}")).ok()
+    })
+    .clone()
+    .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+}
+
+/// The clamp's DXBC, with its root signature.
+#[cfg(windows)]
+fn compiled() -> windows::core::Result<Vec<u8>> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -123,9 +144,18 @@ fn make() -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes.
+    Ok(unsafe {
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+    }
+    .to_vec())
+}
+
+fn make() -> windows::core::Result<Clamp> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let bytes = &compiled()?[..];
+    // SAFETY: the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -212,6 +242,24 @@ mod tests {
         if super::host().is_none() {
             return; // no host GPU here
         }
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+            return; // no HLSL compiler named
+        }
+        #[cfg(not(windows))]
+        let handler = || {
+            victory_loader::linux::signals::install();
+            // SAFETY: a query into a zeroed action of ours.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut action);
+                action.sa_sigaction
+            }
+        };
+        #[cfg(not(windows))]
+        let ours = handler();
         assert!(super::clamp().is_some());
+        // DXC's LLVM took the fault handler at its first compile; ours is back.
+        #[cfg(not(windows))]
+        assert_eq!(handler(), ours);
     }
 }

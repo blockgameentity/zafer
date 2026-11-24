@@ -12,6 +12,8 @@
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
 mod host;
+#[cfg(target_os = "linux")]
+mod linux;
 pub mod modules;
 mod registry;
 pub mod runtime;

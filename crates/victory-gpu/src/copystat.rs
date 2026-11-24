@@ -71,6 +71,16 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     e.2 += us;
 }
 
+#[cfg(not(windows))]
+fn page_faults() -> u64 {
+    // SAFETY: plain data, filled in by the call.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    (usage.ru_minflt + usage.ru_majflt) as u64
+}
+
+#[cfg(windows)]
 fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -131,12 +141,17 @@ pub(crate) fn log(frames: f64) {
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
     for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
-        let kind = info.Type;
+        #[cfg(windows)]
+        let kind = {
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
+            info.Type
+        };
+        #[cfg(not(windows))]
+        let kind = 0;
         tracing::info!(
             "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
             n as f64 / frames,

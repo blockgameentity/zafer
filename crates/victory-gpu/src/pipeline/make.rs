@@ -172,9 +172,15 @@ fn queue(p: Arc<Pending>) {
                 .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
+                    #[cfg(windows)]
                     unsafe {
                         use windows::Win32::System::Threading::*;
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    }
+                    // SAFETY: as above; on Linux `who` 0 is this thread.
+                    #[cfg(not(windows))]
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 5);
                     }
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();

@@ -649,7 +649,23 @@ fn root_signature(
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+        #[cfg(windows)]
+        let serialized = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error));
+        // vkd3d-proton's export (`Option<ID3DBlob>` is a nullable pointer).
+        #[cfg(not(windows))]
+        let serialized = windows::core::HRESULT(
+            victory_shader::hostlib::serialize_versioned_root_signature(
+                (&raw const desc).cast(),
+                (&raw mut blob).cast(),
+                (&raw mut error).cast(),
+            )
+            .map_err(|e| {
+                tracing::warn!("{e}");
+                windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
+            })?,
+        )
+        .ok();
+        if let Err(e) = serialized {
             if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),

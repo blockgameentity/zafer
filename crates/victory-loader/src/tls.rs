@@ -210,7 +210,7 @@ mod tests {
             // SAFETY: our page, made executable to run the patched code.
             unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
             // SAFETY: the page holds the patched load and a return.
-            let f: extern "system" fn() -> usize = unsafe { std::mem::transmute(page) };
+            let f: extern "win64" fn() -> usize = unsafe { std::mem::transmute(page) };
             assert_eq!(f(), tls_array() + 3 * 8, "REX {rex:#x} ModRM {modrm:#x}");
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };

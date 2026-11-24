@@ -22,6 +22,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-windows = { path = "crates/victory-windows" }
 
 # External crates
 anyhow = "1.0.104"
@@ -33,6 +34,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.2"
 object = { version = "0.41.0", default-features = false, features = ["read_core", "pe", "coff", "archive", "std"] }
 windows-sys = "0.61.2"
+# The native Linux runtime's system calls.
+libc = "0.2.191"
 windows = "0.62.2"
 windows-core = "0.62.2"
 blake3 = "1.8.7"

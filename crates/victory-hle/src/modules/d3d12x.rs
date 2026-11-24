@@ -11,7 +11,7 @@ use crate::{HleExport, HleModule};
 
 /// Device creation; first hands the device the title's general allocator
 /// (`XMemAlloc`, which honours the title's hooks) for resource memory.
-extern "system" fn create_device(
+extern "win64" fn create_device(
     adapter: *const c_void,
     parameters: *const u32,
     iid: *const Iid,
@@ -19,8 +19,14 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
-    #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    // A fence's event is one of our events (`CreateEventW`).
+    #[cfg(target_os = "linux")]
+    victory_gpu::fence::on_set_event(|handle| {
+        if let Some(event) = crate::linux::handles::get::<crate::linux::handles::Event>(handle) {
+            event.set();
+        }
+    });
     device::create(adapter, parameters, iid, out)
 }
 
@@ -36,17 +42,22 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// As on Windows, ending with the same code.
+// shortcut: printed, not in the crash log, until the loader's crash log
+// builds on Linux.
+#[cfg(not(windows))]
+fn host_gpu_failed(what: &str) -> ! {
+    eprintln!("VIctory: host GPU failure: {what}");
+    const DXGI_ERROR_DEVICE_REMOVED: i32 = 0x887A_0005_u32 as i32;
+    std::process::exit(DXGI_ERROR_DEVICE_REMOVED)
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
-    #[cfg(windows)]
-    {
-        victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
-        victory_gpu::shader_cache::use_shader_cache(dir);
-    }
-    #[cfg(not(windows))]
-    let _ = dir;
+    victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+    victory_gpu::shader_cache::use_shader_cache(dir);
 }
 
 pub(crate) fn module() -> HleModule {

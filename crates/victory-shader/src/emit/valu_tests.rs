@@ -69,6 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, false)
+}
+
+/// As [`build_valu_cs`]; with `root_srv`, the shader also receives a root
+/// SRV's address in `s[6:7]` (root parameter 2).
+fn build_cs(body: &[u32], root_srv: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -83,7 +89,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    let mut native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -121,6 +127,30 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }),
         code,
     };
+    if root_srv {
+        native.layout.push(RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 6,
+            slot: 2,
+        });
+        native.used.push(UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 6,
+            slot: 2,
+        });
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1, // 8 user SGPRs: s0..s7
+            threads: [1, 1, 1],
+        });
+    }
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -208,6 +238,10 @@ fn run_cases(
             check(label, i, inputs, out[0][0]);
         }
         ran += 1;
+    }
+    if ran == 0 && cfg!(not(windows)) {
+        // Linux has no WARP; without vkd3d-proton there is no device.
+        return;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
@@ -935,5 +969,86 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+#[test]
+fn root_srv_loads_past_the_length_the_host_passes_read_zero() {
+    // The vertex fetch of Grand Theft Auto VI's mesh programs: a descriptor
+    // with no record limit built around a root SRV's address, read at an
+    // offset the program computes. On the host a root SRV is a bare
+    // address, so the translation bounds it by the length in its user data.
+    let mut body = vec![
+        s_mov_b32(12, 6),
+        s_mov_b32(13, 7),
+        s_mov_b32(14, 0xC1), // -1: no record limit
+        s_mov_b32(15, 0xFF), // literal follows
+        0x1101_4FAC,
+        vop1(0x001, 1, sgpr(0)), // v_mov_b32 v1, s0 (the byte offset)
+    ];
+    // buffer_load_dword v0, v1, s[12:15], 0 offen
+    body.extend_from_slice(&[0x38 << 26 | 0x0C << 18 | 1 << 12, 0x80 << 24 | (12 >> 2) << 16 | 1]);
+    let shader = build_cs(&body, true);
+    let len = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Descriptor)
+        .expect("the root SRV's length in the user data");
+    assert_eq!((len.slot, len.index), (2, 6));
+    assert_eq!(shader.root_srvs, [2]);
+
+    let data: Vec<u32> = (0..32u32).map(|i| 0x1000 + i).collect();
+    let cases = [(8, 0x1002), (124, 0x101F), (128, 0), (0x7FFF_FFFC, 0), (0xFFFF_FFFC, 0)];
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    for (offset, want) in cases {
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => [offset, 0, 0, 0][u.dword as usize],
+                RootType::Table => 0,
+                RootType::Descriptor => 4 * data.len() as u32,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: data.clone() }),
+                    ],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][0], want, "offset {offset:#x}");
+    }
+}
+
+#[test]
+fn raw_offsets_past_the_limit_read_zero_and_drop_writes() {
+    // A raw store of 7 and a load back at the byte offset in s0, through
+    // the one-dword raw UAV; the harness stores what was loaded at dword 0.
+    // Offsets that wrap to near 2^32 (data-computed) faulted the RTX 5090
+    // in the title's world load; the translation bounds them (as the
+    // console's record limit does): writes are dropped, reads give 0.
+    let store = [0x38 << 26 | 0x1C << 18 | 1 << 12, 0x80 << 24 | (8 >> 2) << 16 | 2 << 8 | 1];
+    let load = [0x38 << 26 | 0x0C << 18 | 1 << 12, 0x80 << 24 | (8 >> 2) << 16 | 1];
+    let mut body = vec![vop1(0x001, 1, sgpr(0)), vop1(0x001, 2, 128 + 7)];
+    body.extend_from_slice(&store);
+    body.extend_from_slice(&load);
+    let shader = build_valu_cs(&body);
+    let cases = [[0, 0, 0, 0], [4, 0, 0, 0], [0x8000_0000, 0, 0, 0], [0xFFFF_FFF0, 0, 0, 0]];
+    run_cases(&shader, &cases, |label, i, inputs, out| {
+        let want = if i == 0 { 7 } else { 0 };
+        assert_eq!(out, want, "{label}: offset {:#x}", inputs[0]);
     });
 }

@@ -52,9 +52,13 @@ impl Default for HostPolicy {
             "mfplat.dll",
             "mfreadwrite.dll",
         ];
-        HostPolicy {
-            allow: allow.iter().map(|s| s.to_string()).collect(),
+        let mut allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
+        // vccorlib140's BSTRs: ours on Linux (`linux::oleaut32`); on
+        // Windows they stay unresolved, as they always were.
+        if cfg!(target_os = "linux") {
+            allow.push("oleaut32.dll".into());
         }
+        HostPolicy { allow }
     }
 }
 
@@ -91,6 +95,21 @@ pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     };
     imp::resolve(dll, &name)
 }
+
+/// [`function`] as a typed function pointer, looked up once: what the
+/// import would have been bound to (on Linux, our `crate::linux` one).
+macro_rules! host {
+    ($dll:literal, $name:literal: $ty:ty) => {{
+        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| {
+            crate::host::function($dll, $name)
+                .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
+        });
+        // SAFETY: the host exports this function with this signature.
+        unsafe { std::mem::transmute::<usize, $ty>(address) }
+    }};
+}
+pub(crate) use host;
 
 #[cfg(windows)]
 mod imp {
@@ -140,7 +159,21 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux the "host" is our own implementation of those DLLs
+/// (`crate::linux`); nothing is forwarded to a system library.
+#[cfg(target_os = "linux")]
+mod imp {
+    use victory_pe::ImportSymbol;
+
+    pub(super) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
+        match symbol {
+            ImportSymbol::Name { name, .. } => crate::linux::lookup(dll, name),
+            ImportSymbol::Ordinal(o) => crate::linux::lookup_ordinal(dll, *o),
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None

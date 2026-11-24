@@ -13,7 +13,7 @@ miniz_oxide.workspace = true
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
-host = ["dep:windows"]
+host = ["dep:windows", "dep:victory-windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
 
@@ -26,6 +26,15 @@ windows = { workspace = true, optional = true, features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
+
+# On Linux the host D3D12 is vkd3d-proton (`hostlib`), with the same
+# bindings (named `windows` in `lib.rs`).
+[target.'cfg(not(windows))'.dependencies]
+victory-windows = { workspace = true, optional = true }
+libc.workspace = true
+
+[target.'cfg(not(windows))'.dev-dependencies]
+victory-windows.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = [

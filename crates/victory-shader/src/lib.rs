@@ -6,10 +6,16 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+// The `windows` crate's D3D12 bindings, generated for Linux.
+#[cfg(all(not(windows), any(test, feature = "host")))]
+extern crate victory_windows as windows;
+
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
 pub mod gfx10;
+#[cfg(unix)]
+pub mod hostlib;
 pub mod io;
 pub mod ir;
 pub mod native;

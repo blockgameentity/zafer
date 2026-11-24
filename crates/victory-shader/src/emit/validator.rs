@@ -4,10 +4,15 @@
 //!
 //! The DLL is found at `VICTORY_DXIL` if set, else the newest Windows SDK's
 //! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
+//! On Linux it is DXC's `libdxil.so`, only at `VICTORY_DXIL`: its COM is
+//! SysV with the same slots, but 1.10.2605 traps (`ud2`) on some of our
+//! modules (the stub vertex shader, the VALU tests' compute shaders), so
+//! nothing loads it unasked.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+#[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 type Hresult = i32;
@@ -122,6 +127,9 @@ impl Validator {
         if let Some(p) = std::env::var_os("VICTORY_DXIL") {
             return Some(p.into());
         }
+        if cfg!(not(windows)) {
+            return None;
+        }
         let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
         let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
             .ok()?
@@ -133,8 +141,23 @@ impl Validator {
         versions.pop()
     }
 
-    /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
+    /// Loads `path`'s validator (or `dxil.dll` from the DLL search path;
+    /// on Linux, none).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
+        let create = Self::create_instance(path)?;
+        let mut object = std::ptr::null_mut();
+        // SAFETY: the export's signature, with valid GUIDs and out pointer.
+        let hr = unsafe { create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object) };
+        if hr < 0 || object.is_null() {
+            return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
+        }
+        Ok(Validator {
+            object: object.cast(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn create_instance(path: Option<&std::path::Path>) -> Result<CreateInstance, String> {
         let name: Vec<u16> = path
             .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
             .to_string_lossy()
@@ -149,16 +172,18 @@ impl Validator {
             }
             let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
                 .ok_or("dxil.dll lacks DxcCreateInstance")?;
-            let create: CreateInstance = std::mem::transmute(create);
-            let mut object = std::ptr::null_mut();
-            let hr = create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object);
-            if hr < 0 || object.is_null() {
-                return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
-            }
-            Ok(Validator {
-                object: object.cast(),
-            })
+            Ok(std::mem::transmute::<_, CreateInstance>(create))
         }
+    }
+
+    #[cfg(not(windows))]
+    fn create_instance(path: Option<&std::path::Path>) -> Result<CreateInstance, String> {
+        let path = path.ok_or("no DXIL validator: set VICTORY_DXIL to DXC's libdxil.so")?;
+        let library = crate::hostlib::Library::open(&path)
+            .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
+        let create = library.symbol(c"DxcCreateInstance")?;
+        // SAFETY: the export has this signature.
+        Ok(unsafe { std::mem::transmute::<*mut c_void, CreateInstance>(create) })
     }
 
     /// Validates `container` and signs it in place; the error text if it

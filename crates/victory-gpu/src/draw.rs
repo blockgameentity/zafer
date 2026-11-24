@@ -151,6 +151,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// The bytes a root SRV at `address` reaches in its host buffer (what
+/// [`root_view`] binds; 0 if it binds nothing).
+fn root_srv_len(address: u64) -> u32 {
+    crate::shadow::find(address, 1).map_or(0, |s| s.left(address).min(u64::from(u32::MAX)) as u32)
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -313,6 +319,9 @@ impl State {
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
+            // A root SRV's length: the translation reads nothing past it.
+            (Some(Root::View(address)), RootType::Descriptor) => root_srv_len(*address),
+            (_, RootType::Descriptor) => 0,
             _ => {
                 once!(
                     slot,
@@ -493,13 +502,22 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                        Some(Root::View(address)) => root_view(list, *address, srv),
+                        _ => {
+                            once!(slot, "a shader reads a root view the title did not set");
+                            None
+                        }
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
+                    // A root SRV with no host memory behind it still gets a
+                    // live address (its length is 0, so nothing is read).
+                    let gpu = match gpu {
+                        Some(gpu) => gpu,
+                        None if srv => match list.scratch(16) {
+                            Some((gpu, _)) => gpu,
+                            None => continue,
+                        },
+                        None => continue,
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
