@@ -216,7 +216,10 @@ fn system_timestamp() -> u64 {
     // counter `victory-hle`'s `QueryPerformanceCounter` gives the title.
     #[cfg(not(windows))]
     {
-        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         // SAFETY: a valid out pointer.
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
         now.tv_sec as u64 * 10_000_000 + now.tv_nsec as u64 / 100
@@ -402,7 +405,9 @@ extern "win64" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }

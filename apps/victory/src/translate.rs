@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use victory_shader::emit;
+use victory_spirv_emit::report::Report as SpirvReport;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -43,6 +44,9 @@ struct Tally {
     /// Used-resource entries whose root parameter no descriptor traces
     /// to, by resource and root type.
     untraced_used: BTreeMap<String, usize>,
+    /// What the SPIR-V emitter did with each program: how many emitted a
+    /// module and which mnemonics stopped the rest.
+    spirv: SpirvReport,
     /// Root parameters descriptors trace to that no used entry names.
     unlisted: usize,
     /// Vertex and pixel programs, and those whose I/O was raised.
@@ -92,6 +96,7 @@ impl Tally {
     }
 
     fn merge(&mut self, other: Tally) {
+        self.spirv.merge(other.spirv);
         self.containers += other.containers;
         self.duplicates += other.duplicates;
         self.programs += other.programs;
@@ -260,6 +265,13 @@ pub fn run(
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
     println!(
+        "SPIR-V       {} emitted of {} programs ({:.0}% coverage); {} gap kinds",
+        t.spirv.emitted,
+        t.spirv.programs,
+        f64::from(t.spirv.coverage()) * 100.0,
+        t.spirv.gaps.len(),
+    );
+    println!(
         "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
         t.emitted, t.emit_programs, t.validated, t.pipelines
     );
@@ -330,6 +342,10 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
+        // The SPIR-V emitter is the backend we are moving to, so its
+        // coverage is tallied beside the DXIL one's: same programs, same
+        // run, and the gap list is what decides what to implement next.
+        t.spirv.run(std::slice::from_ref(&p));
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(program) => {
                 t.translated += 1;

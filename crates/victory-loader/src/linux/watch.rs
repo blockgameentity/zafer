@@ -64,7 +64,10 @@ pub(crate) fn guarded(block: usize) -> bool {
 }
 
 /// Notes `block` guarded; the caller then makes it read-only.
-pub(crate) fn mark(block: usize) {
+///
+/// Public because the benchmark that measures a taken fault (and any
+/// future diagnostics) needs to arrange one, and nothing else does.
+pub fn mark(block: usize) {
     made()[block / 64].fetch_or(1 << (block % 64), Ordering::AcqRel);
 }
 

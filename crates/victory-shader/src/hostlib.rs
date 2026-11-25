@@ -8,7 +8,7 @@
 //! or `libvkd3d-proton-d3d12.so` itself; unset, the dynamic loader's
 //! search path is used (`docs/linux.md`, GPU).
 
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -17,42 +17,26 @@ const CORE: &str = "libvkd3d-proton-d3d12core.so";
 
 /// A library opened for good (never closed).
 #[derive(Clone, Copy)]
-pub struct Library(usize);
+pub struct Library(&'static libloading::Library);
 
 impl Library {
     /// `path` (a file, or a name the dynamic loader searches for).
     pub fn open(path: &Path) -> Result<Library, String> {
-        let name = CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|_| format!("{}: NUL in path", path.display()))?;
-        // SAFETY: a NUL-terminated path.
-        let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        if handle.is_null() {
-            return Err(last_error());
-        }
-        Ok(Library(handle as usize))
+        // SAFETY: we leak the handle, so the mapping (and anything the
+        // library's initialisers registered) lives as long as the process.
+        let library = unsafe { libloading::Library::new(path.as_os_str()) }
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Library(&*Box::leak(Box::new(library))))
     }
 
     /// The address of export `name`.
     pub fn symbol(self, name: &CStr) -> Result<*mut c_void, String> {
-        // SAFETY: an open library and a NUL-terminated name.
-        let address = unsafe { libc::dlsym(self.0 as *mut c_void, name.as_ptr()) };
-        if address.is_null() {
-            return Err(format!("no {}", name.to_string_lossy()));
-        }
-        Ok(address)
+        // SAFETY: the library is loaded for the life of the program, and the
+        // caller transmutes the address to the signature the export has.
+        let symbol = unsafe { self.0.get::<unsafe extern "system" fn()>(name.to_bytes()) }
+            .map_err(|e| e.to_string())?;
+        Ok(*symbol as *mut c_void)
     }
-}
-
-fn last_error() -> String {
-    // SAFETY: dlerror returns null or a NUL-terminated message.
-    let text = unsafe { libc::dlerror() };
-    if text.is_null() {
-        return "not found".into();
-    }
-    // SAFETY: as above.
-    unsafe { CStr::from_ptr(text) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// vkd3d-proton's `libvkd3d-proton-d3d12.so`, opened once.

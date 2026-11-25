@@ -28,28 +28,26 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
 
-const INIT_VIDEO: u32 = 0x20;
-const INIT_GAMEPAD: u32 = 0x2000;
-const WINDOW_RESIZABLE: u64 = 0x20;
-const WINDOW_VULKAN: u64 = 0x1000_0000;
-const EVENT_QUIT: u32 = 0x100;
-const EVENT_WINDOW_CLOSE_REQUESTED: u32 = 0x210;
-const EVENT_GAMEPAD_ADDED: u32 = 0x653;
-const EVENT_GAMEPAD_REMOVED: u32 = 0x654;
-/// `SDL_GamepadDeviceEvent::which`.
-const EVENT_WHICH: usize = 16;
+// The flag and event numbers come from `sdl3-sys`, which is compiled for
+// its declarations only (`no-link`): SDL is still opened at run time as
+// `libSDL3.so.0`, so a machine without it runs without a window rather
+// than failing to start. What the crate replaces is every hand-copied
+// constant and every byte offset into the event union.
+use sdl3_sys::everything::{
+    SDL_EventType, SDL_InitFlags, SDL_SCANCODE_COUNT, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN,
+};
+
 /// Gamepad slots, as XInput's.
 pub const PADS: usize = 4;
-/// `SDL_SCANCODE_COUNT`.
-const SCANCODES: usize = 512;
 
 /// The SDL3 functions we call.
 struct Api {
-    init: unsafe extern "C" fn(u32) -> bool,
+    init: unsafe extern "C" fn(SDL_InitFlags) -> bool,
     set_hint: unsafe extern "C" fn(*const c_char, *const c_char) -> bool,
     error: unsafe extern "C" fn() -> *const c_char,
-    poll_event: unsafe extern "C" fn(*mut [u8; 128]) -> bool,
-    create_window: unsafe extern "C" fn(*const c_char, c_int, c_int, u64) -> *mut c_void,
+    poll_event: unsafe extern "C" fn(*mut sdl3_sys::events::SDL_Event) -> bool,
+    create_window:
+        unsafe extern "C" fn(*const c_char, c_int, c_int, sdl3_sys::video::SDL_WindowFlags) -> *mut c_void,
     set_window_title: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool,
     create_surface: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut u64) -> bool,
     keyboard_focus: unsafe extern "C" fn() -> *mut c_void,
@@ -172,13 +170,13 @@ fn pump(jobs: Receiver<Job>, ready: Sender<Result<bool, String>>) {
             c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS".as_ptr(),
             c"1".as_ptr(),
         );
-        (api.init)(INIT_VIDEO | INIT_GAMEPAD) || {
+        (api.init)(SDL_InitFlags::VIDEO | SDL_InitFlags::GAMEPAD) || {
             tracing::warn!(error = api.last_error(), "no SDL video; no window");
             false
         }
     };
     // SAFETY: as above.
-    if !video && !unsafe { (api.init)(INIT_GAMEPAD) } {
+    if !video && !unsafe { (api.init)(SDL_InitFlags::GAMEPAD) } {
         let _ = ready.send(Err(format!("SDL3 did not start: {}", api.last_error())));
         return;
     }
@@ -187,25 +185,29 @@ fn pump(jobs: Receiver<Job>, ready: Sender<Result<bool, String>>) {
         video,
         ..Default::default()
     };
-    let mut event = [0u8; 128];
+    // SAFETY: an all-zero event is SDL's own `SDL_EVENT_FIRST` shape, and
+    // the union is only read through the variant the event's type names.
+    let mut event: sdl3_sys::events::SDL_Event = unsafe { std::mem::zeroed() };
     loop {
         while let Ok(job) = jobs.try_recv() {
             job(&api, &mut state);
         }
-        // SAFETY: room for one event.
+        // SAFETY: room for one event, which SDL fills in.
         while unsafe { (api.poll_event)(&mut event) } {
-            let kind = u32::from_ne_bytes(event[..4].try_into().unwrap());
-            let which = u32::from_ne_bytes(event[EVENT_WHICH..EVENT_WHICH + 4].try_into().unwrap());
-            match kind {
-                EVENT_QUIT | EVENT_WINDOW_CLOSE_REQUESTED => {
+            // SAFETY: `type` is the tag every variant starts with.
+            let kind = unsafe { event.r#type };
+            // SAFETY: a gamepad device event's `which` is its own field.
+            let which = unsafe { event.gdevice.which };
+            match SDL_EventType(kind) {
+                SDL_EventType::QUIT | SDL_EventType::WINDOW_CLOSE_REQUESTED => {
                     // The runtime's SIGTERM handler ends the title as the
                     // console does (suspend, then end).
                     tracing::info!("window closed; ending the run");
                     // SAFETY: raise has no preconditions.
                     unsafe { libc::raise(libc::SIGTERM) };
                 }
-                EVENT_GAMEPAD_ADDED => connect(&api, which),
-                EVENT_GAMEPAD_REMOVED => disconnect(&api, which),
+                SDL_EventType::GAMEPAD_ADDED => connect(&api, which.0),
+                SDL_EventType::GAMEPAD_REMOVED => disconnect(&api, which.0),
                 _ => {}
             }
         }
@@ -272,7 +274,7 @@ fn window(width: u32, height: u32) -> Result<usize, String> {
                     c"VIctory".as_ptr(),
                     width as c_int,
                     height as c_int,
-                    WINDOW_VULKAN | WINDOW_RESIZABLE,
+                    SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE,
                 )
             } as usize;
             if state.window == 0 {
@@ -366,7 +368,7 @@ pub fn keys() -> Vec<u16> {
         }
         let mut count = 0;
         let state = (sdl.api.keyboard_state)(&mut count);
-        let count = (count.max(0) as usize).min(SCANCODES);
+        let count = (count.max(0) as usize).min(SDL_SCANCODE_COUNT.0 as usize);
         (0..count as u16)
             .filter(|&i| *state.add(usize::from(i)))
             .collect()

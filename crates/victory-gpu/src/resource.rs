@@ -861,7 +861,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -1425,8 +1428,7 @@ mod tests {
         let device = crate::device::device();
         // GetCustomHeapProperties (0xd0): the struct comes back through the
         // hidden first argument, which is also returned.
-        type Custom =
-            extern "win64" fn(*mut HeapProperties, This, u32, u32) -> *mut HeapProperties;
+        type Custom = extern "win64" fn(*mut HeapProperties, This, u32, u32) -> *mut HeapProperties;
         let mut p = PROPERTIES;
         let back = slot::<Custom>(device, 0xd0)(&mut p, device, 1, 2);
         assert_eq!(back, &raw mut p);

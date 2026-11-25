@@ -15,6 +15,7 @@ mod advapi32_eventing;
 mod advapi32_registry;
 mod audio_out;
 mod bcrypt;
+mod code_page;
 mod combase;
 mod crypt32;
 mod dbghelp;

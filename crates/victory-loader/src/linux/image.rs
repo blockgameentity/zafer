@@ -5,6 +5,9 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::ptr::NonNull;
+
+use rustix::mm::{MapFlags, MprotectFlags, ProtFlags};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -52,54 +55,59 @@ pub struct BindReport {
 }
 
 fn page_size() -> usize {
-    // SAFETY: sysconf has no preconditions.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    // `rustix::param::page_size` is a cached read of the same value
+    // `sysconf(_SC_PAGESIZE)` reports, without the call or the `unsafe`.
+    rustix::param::page_size()
 }
 
 /// `size` bytes of fresh read-write memory at `at` exactly, or (`None`)
 /// wherever the kernel likes on a 64 KiB boundary.
 fn map(at: Option<usize>, size: usize) -> Option<usize> {
-    let prot = libc::PROT_READ | libc::PROT_WRITE;
-    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let prot = ProtFlags::READ | ProtFlags::WRITE;
     let Some(at) = at else {
         // 64 KiB more, then the ends are cut off.
         // SAFETY: a fresh anonymous mapping; no existing memory is touched.
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), size + GRANULE, prot, flags, -1, 0) };
-        if p == libc::MAP_FAILED {
-            return None;
+        let p = unsafe {
+            rustix::mm::mmap_anonymous(
+                std::ptr::null_mut(),
+                size + GRANULE,
+                prot,
+                MapFlags::PRIVATE,
+            )
         }
+        .ok()?;
         let raw = p as usize;
         let base = raw.next_multiple_of(GRANULE);
-        // SAFETY: trims our own mapping to [base, base + size).
-        unsafe {
-            if base != raw {
-                libc::munmap(p, base - raw);
-            }
-            libc::munmap((base + size) as *mut c_void, raw + GRANULE - base);
+        if base != raw {
+            // SAFETY: `p` is our mapping, `base - raw` bytes at its start.
+            unsafe { rustix::mm::munmap(p, base - raw).ok()? };
         }
+        // SAFETY: `base + size` is inside our mapping, and the tail is
+        // `raw + GRANULE - base` bytes from it.
+        unsafe { rustix::mm::munmap((base + size) as *mut c_void, raw + GRANULE - base).ok()? };
         return Some(base);
     };
-    // SAFETY: NOREPLACE never touches an existing mapping.
+    // NOREPLACE never touches an existing mapping, so a taken address is a
+    // refusal rather than a silent move.
+    // SAFETY: FIXED_NOREPLACE never touches an existing mapping, so a taken
+    // address is a refusal rather than a silent move.
     let p = unsafe {
-        libc::mmap(
+        rustix::mm::mmap_anonymous(
             at as *mut c_void,
             size,
             prot,
-            flags | libc::MAP_FIXED_NOREPLACE,
-            -1,
-            0,
+            MapFlags::PRIVATE | MapFlags::FIXED_NOREPLACE,
         )
-    };
-    if p == libc::MAP_FAILED {
-        return None;
     }
-    if p as usize != at {
-        // A kernel before 4.17 takes the address as a hint.
-        // SAFETY: our fresh mapping.
-        unsafe { libc::munmap(p, size) };
-        return None;
+    .ok()?;
+    if p as usize == at {
+        return Some(at);
     }
-    Some(at)
+    // A kernel before 4.17 takes the address as a hint; that is not the
+    // placement the loader needs, so give it back.
+    // SAFETY: `p` is our fresh mapping.
+    unsafe { rustix::mm::munmap(p, size).ok()? };
+    None
 }
 
 /// Maps `original` (a PE32+ file read from `path`): copies its headers and
@@ -123,7 +131,10 @@ pub fn load(original: &[u8], path: &Path) -> Result<LoadedImage> {
     };
     let unmap = || {
         // SAFETY: our mapping, not yet handed out.
-        unsafe { libc::munmap(base as *mut c_void, size) };
+        if let Some(p) = NonNull::new(base as *mut c_void) {
+            // SAFETY: `p` is the mapping's start and `size` its length.
+            unsafe { rustix::mm::munmap(p.cast().as_ptr(), size) }.ok();
+        };
     };
     let mapped = (|| {
         // SAFETY: the mapping is `size` bytes, read-write and ours.
@@ -200,8 +211,21 @@ pub fn load(original: &[u8], path: &Path) -> Result<LoadedImage> {
 }
 
 /// Reads and maps the image at `path` (see [`load`]).
+///
+/// The file is *mapped* rather than read: a title's main image is tens of
+/// megabytes, and `load` only ever looks at it, so `fs::read` would copy the
+/// whole thing through a `Vec` for nothing. A read-only mapping is the same
+/// bytes at the same cost as the page cache already paid, and the file
+/// cannot change under us because a title's image is not something the
+/// title rewrites.
 pub fn load_file(path: &Path) -> Result<LoadedImage> {
-    let original = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: the mapping is read-only, and a title's image file is not
+    // modified while it is running — the same assumption `fs::read` makes
+    // about the contents it copies.
+    let original = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("mapping {}", path.display()))?;
     load(&original, path).with_context(|| format!("loading {}", path.display()))
 }
 
@@ -265,18 +289,15 @@ fn windows_protection(characteristics: u32) -> u32 {
     }
 }
 
-fn native_protection(characteristics: u32) -> libc::c_int {
-    libc::PROT_READ
-        | if characteristics & SCN_MEM_WRITE != 0 {
-            libc::PROT_WRITE
-        } else {
-            0
-        }
-        | if characteristics & SCN_MEM_EXECUTE != 0 {
-            libc::PROT_EXEC
-        } else {
-            0
-        }
+fn native_protection(characteristics: u32) -> ProtFlags {
+    let mut prot = ProtFlags::READ;
+    if characteristics & SCN_MEM_WRITE != 0 {
+        prot |= ProtFlags::WRITE;
+    }
+    if characteristics & SCN_MEM_EXECUTE != 0 {
+        prot |= ProtFlags::EXEC;
+    }
+    prot
 }
 
 /// Maps the DLLs the title ships in `title_dir` that `main` imports,
@@ -523,13 +544,13 @@ impl LoadedImage {
     }
 
     /// The protection of the section holding `rva` (headers: read-only).
-    fn protection_at(&self, rva: usize) -> libc::c_int {
+    fn protection_at(&self, rva: usize) -> ProtFlags {
         self.info
             .sections
             .iter()
             .rev()
             .find(|s| rva >= s.rva as usize)
-            .map_or(libc::PROT_READ, |s| native_protection(s.characteristics))
+            .map_or(ProtFlags::READ, |s| native_protection(s.characteristics))
     }
 
     /// Headers read-only, then each section's own protection, also as the
@@ -542,14 +563,16 @@ impl LoadedImage {
             let start = (self.base + rva) & !(page - 1);
             let end = (self.base + rva + len).next_multiple_of(page);
             vm::adopt(start, end - start, windows_protection(characteristics));
-            // SAFETY: inside our mapping of the image.
-            if unsafe { libc::mprotect(start as *mut c_void, end - start, prot) } != 0 {
-                tracing::warn!(
-                    rva,
-                    len,
-                    "mprotect of an image range failed: {}",
-                    std::io::Error::last_os_error()
-                );
+            // `rustix` reports the errno through `io::Error` and takes the
+            // range as a pointer, so the `unsafe` is the same one call and
+            // the failure message no longer reads `last_os_error`.
+            let Some(p) = NonNull::new(start as *mut c_void) else {
+                return;
+            };
+            let mprot = MprotectFlags::from_bits_truncate(prot.bits());
+            // SAFETY: [start, end) is inside our mapping of the image.
+            if let Err(e) = unsafe { rustix::mm::mprotect(p.cast().as_ptr(), end - start, mprot) } {
+                tracing::warn!(rva, len, "mprotect of an image range failed: {e}");
             }
         };
         set(0, headers, SCN_MEM_READ);
@@ -579,17 +602,22 @@ impl LoadedImage {
             let start = slot as usize & !(page - 1);
             let len = (slot as usize + 8).next_multiple_of(page) - start;
             let old = self.protection_at(start - self.base);
-            // SAFETY: pages of our image mapping.
-            if unsafe { libc::mprotect(start as *mut c_void, len, old | libc::PROT_WRITE) } != 0 {
-                bail!(
-                    "mprotect(IAT slot {rva:#x}) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+            let Some(p) = NonNull::new(start as *mut c_void) else {
+                bail!("IAT slot {rva:#x} at a null address");
+            };
+            let writable = MprotectFlags::from_bits_truncate((old | ProtFlags::WRITE).bits());
+            // SAFETY: pages of our image mapping, inside it by construction.
+            unsafe { rustix::mm::mprotect(p.cast().as_ptr(), len, writable) }.with_context(|| {
+                format!("mprotect(IAT slot {rva:#x})")
+            })?;
             // SAFETY: inside the image, now writable; the PE format aligns slots.
             unsafe { slot.write_volatile(address as u64) };
-            // SAFETY: restoring the protection we just changed.
-            unsafe { libc::mprotect(start as *mut c_void, len, old) };
+            let restore = MprotectFlags::from_bits_truncate(old.bits());
+            // SAFETY: restoring the protection this function just changed,
+            // over the same range it changed it in.
+            unsafe { rustix::mm::mprotect(p.cast().as_ptr(), len, restore) }.with_context(|| {
+                format!("restoring the protection of IAT slot {rva:#x}")
+            })?;
         }
         Ok(())
     }
@@ -734,6 +762,9 @@ impl LoadedImage {
         }
         let size = (self.info.size_of_image as usize).next_multiple_of(page_size());
         // SAFETY: guaranteed by the caller.
-        unsafe { libc::munmap(self.base as *mut c_void, size) };
+        if let Some(p) = NonNull::new(self.base as *mut c_void) {
+            // SAFETY: `p` is the mapping's start and `size` its length.
+            unsafe { rustix::mm::munmap(p.cast().as_ptr(), size) }.ok();
+        };
     }
 }

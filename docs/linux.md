@@ -121,6 +121,20 @@ shared.
   `victory_gpu::kernel_will_write` first (the file layer and UCRT reads,
   DirectStorage), and writes into the physical pool outside the views call
   `vm::pool_written`.
+- **What mapping a title image saves (measured).** `cargo bench -p
+  victory-loader --bench image`, on a 256 MiB image: `fs::read` 39.2 ms,
+  `memmap2::Mmap` 2.9 us. The loader only reads the image, so the copy was
+  pure loss; `load_file` maps now.
+- **What write watching costs (measured).** `cargo bench -p victory-loader
+  --bench watch`, on this machine: a plain write to an open block is 33 ns;
+  a `mprotect` guard-and-open pair is 1.35 us; guarding 64 blocks in a
+  batch is 792 ns per block, so guarding a 1 MiB copy costs 12.7 us; and a
+  *taken* fault — the guarded write plus the handler's round trip — is
+  2451 ns, **74x a plain write**. So the cost is not the guard, it is the
+  number of faults: a copy whose blocks the title then writes heavily pays
+  ~74x per first write per block. That is the number to watch in a
+  profile against a real title, and the reason the guard is per 64 KiB
+  block (16 faults per MiB) rather than per page (256).
 - **Not yet:** the DXIL validator and the indirect argument clamp's compiler by default
   (below), fence events until the handle table registers its `SetEvent`
   (`victory_gpu::fence::on_set_event`), the debug layer and WARP.

@@ -106,7 +106,8 @@ pub(crate) fn compiled() -> windows::core::Result<Vec<u8>> {
     DXIL.get_or_init(|| {
         let dxil = victory_shader::hostlib::compile_hlsl(SOURCE, "main", "cs_6_0");
         victory_loader::linux::signals::reclaim();
-        dxil.inspect_err(|e| tracing::warn!("argument clamp: {e}")).ok()
+        dxil.inspect_err(|e| tracing::warn!("argument clamp: {e}"))
+            .ok()
     })
     .clone()
     .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
@@ -137,7 +138,10 @@ fn compiled() -> windows::core::Result<Vec<u8>> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
@@ -229,7 +233,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }

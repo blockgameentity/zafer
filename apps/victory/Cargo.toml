@@ -15,6 +15,7 @@ victory-hle.workspace = true
 victory-gpu.workspace = true
 parking_lot.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
+victory-spirv-emit.workspace = true
 tracing.workspace = true
 victory-game.workspace = true
 anyhow.workspace = true

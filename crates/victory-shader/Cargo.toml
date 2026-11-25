@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 miniz_oxide.workspace = true
+victory-spirv.workspace = true
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
@@ -31,7 +32,7 @@ windows = { workspace = true, optional = true, features = [
 # bindings (named `windows` in `lib.rs`).
 [target.'cfg(not(windows))'.dependencies]
 victory-windows = { workspace = true, optional = true }
-libc.workspace = true
+libloading.workspace = true
 
 [target.'cfg(not(windows))'.dev-dependencies]
 victory-windows.workspace = true

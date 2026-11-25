@@ -46,8 +46,9 @@ mod sampler;
 pub mod shader_cache;
 mod shadow;
 pub mod signature;
-pub mod vulkan;
 mod texture;
+
+pub use victory_vulkan as vulkan;
 mod watch;
 
 pub use host::on_failure;

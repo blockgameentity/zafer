@@ -76,6 +76,17 @@ enum CodePage {
     Utf8,
     Cp1252,
     Cp437,
+    /// A lead-byte page, converted by `encoding_rs` from the number alone.
+    Dbcs(u32),
+}
+
+impl CodePage {
+    /// Whether this is a lead-byte (DBCS) page, whose characters can be
+    /// two bytes.
+    fn dbcs(self) -> bool {
+        matches!(self, CodePage::Dbcs(_))
+    }
+
 }
 
 fn code_page(cp: u32) -> Option<CodePage> {
@@ -83,6 +94,7 @@ fn code_page(cp: u32) -> Option<CodePage> {
         CP_ACP | CP_THREAD_ACP | 1252 => Some(CodePage::Cp1252),
         CP_OEMCP | 437 => Some(CodePage::Cp437),
         CP_UTF8 => Some(CodePage::Utf8),
+        932 | 936 | 949 | 950 => Some(CodePage::Dbcs(cp)),
         _ => None,
     }
 }
@@ -118,6 +130,19 @@ fn decode(cp: CodePage, bytes: &[u8], strict: bool) -> Option<Vec<u16>> {
         CodePage::Utf8 if strict => Some(std::str::from_utf8(bytes).ok()?.encode_utf16().collect()),
         // Rust's lossy decoding replaces each maximal ill-formed subpart.
         CodePage::Utf8 => Some(String::from_utf8_lossy(bytes).encode_utf16().collect()),
+        // A lead-byte page: `encoding_rs` walks its tables and reports
+        // whether anything was unmappable, which is exactly what
+        // `MB_ERR_INVALID_CHARS` asks about.
+        CodePage::Dbcs(number) => {
+            // `None` here means the page is not one we implement, which
+            // `code_page` has already refused.
+            let encoding = crate::linux::code_page::encoding(number)?;
+            let (text, _, unmappable) = encoding.decode(bytes);
+            if strict && unmappable {
+                return None;
+            }
+            Some(text.encode_utf16().collect())
+        }
         _ => Some(bytes.iter().map(|&b| high_half(cp)(b)).collect()),
     }
 }
@@ -211,6 +236,43 @@ pub extern "win64" fn WideCharToMultiByte(
             }
         }
         s.into_bytes()
+    } else if let CodePage::Dbcs(number) = page {
+        // The DBCS direction: `encoding_rs` owns the tables, and the
+        // substitute byte is the caller's default character, as Windows
+        // documents (a `?` when the title passes none).
+        if !used.is_null() {
+            return fail(ERROR_INVALID_PARAMETER);
+        }
+        // SAFETY: null or the caller's default character.
+        let fallback = unsafe { default.as_ref() }.copied().unwrap_or(b'?');
+        let Some(encoding) = crate::linux::code_page::encoding(number) else {
+            return fail(ERROR_INVALID_PARAMETER);
+        };
+        let units: Vec<u16> = text.to_vec();
+        let wide = String::from_utf16_lossy(&units);
+        let (bytes, _, unmappable) = encoding.encode(&wide);
+        let strict = flags & WC_ERR_INVALID_CHARS != 0;
+        if strict && unmappable {
+            return fail(ERROR_NO_UNICODE_TRANSLATION);
+        }
+        if unmappable {
+            // Windows substitutes per character, not per string; a string
+            // with anything unmappable re-encodes unit by unit so the ones
+            // that do map keep their bytes.
+            let mut out_bytes = Vec::with_capacity(bytes.len());
+            for c in String::from_utf16_lossy(&units).chars() {
+                let mut buf = [0u8; 4];
+                let (mapped, _, bad) = encoding.encode(c.encode_utf8(&mut buf));
+                if bad {
+                    out_bytes.push(fallback);
+                } else {
+                    out_bytes.extend_from_slice(&mapped);
+                }
+            }
+            out_bytes
+        } else {
+            bytes.into_owned()
+        }
     } else {
         // SAFETY: null or the caller's default character.
         let fallback = unsafe { default.as_ref() }.copied().unwrap_or(b'?');
@@ -261,24 +323,58 @@ pub extern "win64" fn GetCPInfo(cp: u32, out: *mut CpInfo) -> i32 {
     if out.is_null() {
         return fail(ERROR_INVALID_PARAMETER);
     }
+    // A DBCS page's characters can be two bytes, and its lead-byte ranges
+    // are what `IsDBCSLeadByteEx` reports; `CPINFO` publishes them as
+    // 1-byte-or-more ranges terminated by a zero-length one.
+    let mut lead_byte = [0u8; 12];
+    if page.dbcs() {
+        let ranges: &[(u8, u8)] = match cp {
+            932 => &[(0x81, 0x9F), (0xE0, 0xFC)],
+            936 | 949 | 950 => &[(0x81, 0xFE)],
+            _ => &[],
+        };
+        for (i, &(low, high)) in ranges.iter().take(5).enumerate() {
+            lead_byte[i * 2] = low;
+            lead_byte[i * 2 + 1] = high;
+        }
+    }
     let info = CpInfo {
-        max_char_size: if page == CodePage::Utf8 { 4 } else { 1 },
+        max_char_size: if page == CodePage::Utf8 {
+            4
+        } else if page.dbcs() {
+            2
+        } else {
+            1
+        },
         default_char: [b'?', 0],
-        lead_byte: [0; 12],
+        lead_byte,
     };
     // SAFETY: the caller's CPINFO.
     unsafe { out.write_unaligned(info) };
     1
 }
 
-/// No code page here has lead bytes.
-pub extern "win64" fn IsDBCSLeadByte(_byte: u8) -> i32 {
-    0
+/// `IsDBCSLeadByte`: the ANSI code page's lead-byte test.
+///
+/// This used to answer "no code page has lead bytes", which is true only
+/// of the Western pages we implemented at the time and false for every
+/// Japanese, Korean and Chinese one.
+pub extern "win64" fn IsDBCSLeadByte(byte: u8) -> i32 {
+    IsDBCSLeadByteEx(CP_ACP, byte)
 }
 
-pub extern "win64" fn IsDBCSLeadByteEx(_cp: u32, _byte: u8) -> i32 {
-    0
+pub extern "win64" fn IsDBCSLeadByteEx(cp: u32, byte: u8) -> i32 {
+    let cp = if matches!(cp, CP_ACP | CP_THREAD_ACP) {
+        1252
+    } else {
+        cp
+    };
+    i32::from(crate::linux::code_page::is_lead_byte(cp, byte))
 }
+
+#[cfg(test)]
+#[path = "kernel32_text_tests.rs"]
+mod dbcs_tests;
 
 // ---- comparison and sort keys ---------------------------------------------------------------
 
@@ -956,7 +1052,10 @@ mod tests {
                 IsValidCodePage(65001),
                 IsValidCodePage(932)
             ),
-            (1252, 437, 1, 0)
+            // 932 is a page we now convert (see `code_page`), so it is
+            // valid; it used to be refused, which is the bug the DBCS
+            // tests cover.
+            (1252, 437, 1, 1)
         );
     }
 

@@ -15,9 +15,22 @@ anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+victory-vulkan.workspace = true
+sdl3-sys = { version = "0.7.3", default-features = false, features = ["no-link", "use-ash-v0-38"] }
+crc32fast.workspace = true
+bytemuck.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# `cargo bench -p victory-gpu --bench crc`: one plain `main`, no harness.
+[[bench]]
+name = "crc"
+harness = false
+
+[[bench]]
+name = "cast"
+harness = false
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).

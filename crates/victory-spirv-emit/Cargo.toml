@@ -1,0 +1,22 @@
+[package]
+name = "victory-spirv-emit"
+description = "The console's GFX10 IR to SPIR-V: the Vulkan backend's shader emitter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cpp_demangle.workspace = true
+tracing.workspace = true
+victory-shader.workspace = true
+victory-spirv.workspace = true
+thiserror.workspace = true
+
+[features]
+# Debugging switches (dumping the module a shader emits).
+diagnostics = []
+
+[lints]
+workspace = true

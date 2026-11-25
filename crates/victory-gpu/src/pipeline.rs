@@ -274,7 +274,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -331,12 +334,7 @@ pub(crate) extern "win64" fn create_graphics(
     };
     let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
-    hand_out(
-        shaders,
-        None,
-        iid,
-        out,
-    )
+    hand_out(shaders, None, iid, out)
 }
 
 /// Device method.
@@ -444,17 +442,10 @@ pub(crate) extern "win64" fn create_stream(
             shaders.extend(copy(stage, code));
         }
         // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, desc.stream.add(at))
-        };
+        unsafe { graphics.read(kind, desc.stream.add(at)) };
         at += size;
     }
-    hand_out(
-        shaders,
-        Some(Box::new(graphics)),
-        iid,
-        out,
-    )
+    hand_out(shaders, Some(Box::new(graphics)), iid, out)
 }
 
 extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
