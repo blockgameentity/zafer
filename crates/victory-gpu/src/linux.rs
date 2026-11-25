@@ -299,7 +299,13 @@ pub(crate) fn window(width: u32, height: u32) -> Result<usize, String> {
 /// `VK_KHR_wayland_surface` and it has to be enabled when the instance is
 /// created.
 pub(crate) fn wayland_instance_extensions() -> Vec<String> {
-    vec!["VK_KHR_wayland_surface".to_owned()]
+    // `VK_KHR_surface` is the base the platform extension is layered on:
+    // without it `ash` never loads `get_physical_device_surface_formats`,
+    // and the first swapchain call is a panic rather than an error.
+    vec![
+        "VK_KHR_surface".to_owned(),
+        "VK_KHR_wayland_surface".to_owned(),
+    ]
 }
 
 /// The instance extensions SDL needs for a surface on its own window.
