@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 
 [dev-dependencies]
+rspirv = "0.13.0"
 
 [lints]
 workspace = true

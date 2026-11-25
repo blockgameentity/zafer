@@ -122,6 +122,7 @@ impl<'a> Emitter<'a> {
         let name = inst.name();
         let f32_ = self.types.f32_;
         let i32_ = self.types.i32_;
+        let u32_ = self.types.u32_;
         let bool_ = self.types.bool_;
         let dst = match v.dst {
             Some(operand) => register_of(operand),
@@ -157,7 +158,11 @@ impl<'a> Emitter<'a> {
             }
             "v_cvt_u32_f32" => {
                 let value = self.plain_f32(b, inst, v.src[0]);
-                b.convert_f_to_u(i32_, value)
+                // The result type of `OpConvertFToU` must be unsigned;
+                // passing the signed type is what `spirv-val` reports as
+                // "expected unsigned int scalar or vector type". This is a
+                // 32-bit unsigned convert, so the bits match either way.
+                b.convert_f_to_u(u32_, value)
             }
             // Rounds toward -inf / to nearest before converting, which is
             // what these two mnemonics mean and what a plain convert does
@@ -262,8 +267,42 @@ impl<'a> Emitter<'a> {
                 });
             }
         };
+        // A register variable holds a dword, so a float-producing
+        // instruction's result is bitcast back to `i32` before the store:
+        // storing `float` into an `int` variable is what `spirv-val`
+        // reports as "pointer's type does not match object's type".
+        let result = if Self::produces_float(name) {
+            b.bitcast(i32_, result)
+        } else {
+            result
+        };
         self.store_i32(b, dst, result);
         Ok(())
+    }
+
+    /// Whether `name`'s result is a float.
+    ///
+    /// The register file is dwords, and an instruction's result type must
+    /// match the variable it lands in, so every arm that computes in
+    /// `float` has to be known here. The conversions *out of* float and the
+    /// half/pack forms are the exceptions: they produce integers.
+    pub(super) fn produces_float(name: &str) -> bool {
+        // A comparison's result is a lane mask, whatever its sources are.
+        if name.starts_with("v_cmp") {
+            return false;
+        }
+        // `v_cvt_<result>_<source>` names its result first (`v_cvt_f32_u32`
+        // is a float); every other vector instruction names its result type
+        // last (`v_add_f32`). A conversion's modifier (`v_cvt_flr_i32_f32`)
+        // sits where the result type would, and is not `f32`, which is the
+        // answer for those too.
+        let tokens: Vec<&str> = name.split('_').collect();
+        let result = if tokens.len() > 2 && tokens.get(1) == Some(&"cvt") {
+            tokens[2]
+        } else {
+            tokens.last().copied().unwrap_or_default()
+        };
+        result == "f32"
     }
 
     /// `min3`/`max3`/`med3` of `a`, `c`, `d`: two two-input picks, since

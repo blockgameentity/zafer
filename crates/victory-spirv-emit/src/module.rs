@@ -71,6 +71,9 @@ pub struct Module {
     void: Id,
     /// The `GLSL.std.450` set imported at construction.
     glsl: Id,
+    /// The compute workgroup size, once the emitter knows the console's
+    /// thread group (see [`Module::set_local_size`]).
+    local_size: Option<[u32; 3]>,
 }
 
 impl Module {
@@ -116,9 +119,21 @@ impl Module {
             i32_vecs,
             bool_vecs,
             glsl,
+            local_size: None,
             interface: Vec::new(),
             void,
         }
+    }
+
+    /// The console's thread group: the workgroup a compute shader runs in.
+    ///
+    /// Vulkan requires one declared for a `GLCompute` entry point, and it
+    /// has to be the console's, because a program's thread id, its lane
+    /// masks and its shared memory are all laid out in a group of that
+    /// shape. The mode itself is written in [`Module::finish`], which is
+    /// where the entry point's id exists.
+    pub fn set_local_size(&mut self, x: u32, y: u32, z: u32) {
+        self.local_size = Some([x.max(1), y.max(1), z.max(1)]);
     }
 
     /// The `GLSL.std.450` set's id, for `OpExtInst`.
@@ -229,6 +244,19 @@ impl Module {
                 function.id,
                 victory_spirv::ops::ExecutionMode::OriginUpperLeft,
                 &[],
+            );
+        }
+        // A compute shader must declare its workgroup size: Vulkan has no
+        // default, and `spirv-val` rejects a `GLCompute` entry point
+        // without `LocalSize`. The emitter sets the real one from the
+        // console's thread group before it finishes (`set_local_size`); this
+        // is the single-threaded fallback.
+        if self.stage == Stage::Compute {
+            let [x, y, z] = self.local_size.unwrap_or([1, 1, 1]);
+            self.builder.execution_mode(
+                function.id,
+                victory_spirv::ops::ExecutionMode::LocalSize,
+                &[x, y, z],
             );
         }
         body(&mut self.builder, function);

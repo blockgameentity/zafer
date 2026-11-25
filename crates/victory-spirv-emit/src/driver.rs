@@ -6,7 +6,7 @@
 //! because tracing per-lane descriptors reads it) and hands the four to the
 //! emitter.
 
-use victory_shader::native::{HwStage, NativeProgram};
+use victory_shader::native::{HwStage, NativeProgram, StageIo};
 use victory_shader::{io, ir, native, resource, structure};
 
 use crate::Error;
@@ -98,11 +98,22 @@ pub fn emit(
         HwStage::Cs => Stage::Compute,
         _ => Stage::Vertex,
     };
-    let module = Module::new(stage);
+    let mut module = Module::new(stage);
+    // A compute program's workgroup is the console's thread group: the
+    // thread ids, the lane masks and the shared memory are all laid out in
+    // a group of that shape, so Vulkan gets that shape and not a guess.
+    if let StageIo::Cs(cs) = &program.io {
+        module.set_local_size(cs.threads[0], cs.threads[1], cs.threads[2]);
+    }
     let mut emitter = crate::emitter::Emitter::new(program, p, st, io, res);
     let spirv = module.finish("main", |b, function| {
         emitter.run(b, function);
     });
+    // A module nothing has checked is only known to be a module; the
+    // validator is what makes "emitted" mean "Vulkan will take it".
+    if let Some(why) = crate::validate::validate(&spirv).reason() {
+        return Err(Error::Invalid(why.to_owned()));
+    }
     Ok(Translation {
         spirv,
         stage: program.stage,

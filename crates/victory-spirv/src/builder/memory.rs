@@ -13,7 +13,10 @@ impl Builder {
     pub fn variable(&mut self, ty: Id, space: StorageClass, initializer: Option<Id>) -> Id {
         let ptr = self.pointer(space, ty);
         let id = self.module.id();
-        let operands = initializer.map(|i| i.0).into_iter().collect::<Vec<_>>();
+        // The storage class is an operand of its own, before the
+        // initializer: a module without it is not SPIR-V.
+        let mut operands = vec![space as u32];
+        operands.extend(initializer.map(|i| i.0));
         self.module
             .op(Op::Variable, Some(ptr), Some(id), &operands);
         id
@@ -29,8 +32,12 @@ impl Builder {
     ) -> Id {
         let ptr = self.pointer(space, ty);
         let id = self.module.id();
-        let operands = initializer.map(|i| i.0).into_iter().collect::<Vec<_>>();
-        block.op(self, Op::Variable, Some(ptr), Some(id), &operands);
+        let mut operands = vec![space as u32];
+        operands.extend(initializer.map(|i| i.0));
+        // A function variable lives in the body, not with the types.
+        self.module
+            .op_in_function(Op::Variable, Some(ptr), Some(id), &operands);
+        let _ = block;
         id
     }
 

@@ -201,8 +201,17 @@ fn translate_one(
     // Through the cache the run reads, once: `host_shader` translates and
     // stores, so a hit here is exactly the entry `run` will find, and a
     // refusal is recorded so the next boot does not pay for it again.
-    match victory_gpu::shader_cache::host_shader(data) {
-        Ok(_) => None,
+    // Under Vulkan the module the run binds is the SPIR-V one, so that is
+    // the translation the warm-up must pay for and report. The DXIL
+    // translation is a different encoder's answer about a shader Vulkan
+    // never runs; precompiling it here would report failures the title
+    // cannot hit and hide the ones it can.
+    #[cfg(target_os = "linux")]
+    let translated = victory_gpu::spirv_cache::spirv_module(data).map(|_| ());
+    #[cfg(not(target_os = "linux"))]
+    let translated = victory_gpu::shader_cache::host_shader(data).map(|_| ());
+    match translated {
+        Ok(()) => None,
         Err(e) => {
             victory_gpu::shader_cache::record_refusal(data, &e);
             Some(e)
@@ -562,7 +571,12 @@ pub fn warm_everything(jobs: Option<usize>) -> Result<()> {
                             lock(&failed).push((why, path.clone()));
                             return (false, true);
                         }
-                        let done = victory_gpu::shader_cache::host_shader(container);
+                        // The module Vulkan binds, not the DXIL one it never
+                        // runs: see `translate_one`.
+                        #[cfg(target_os = "linux")]
+                        let done = victory_gpu::spirv_cache::spirv_module(container);
+                        #[cfg(not(target_os = "linux"))]
+                        let done = victory_gpu::shader_cache::host_shader(container).map(|_| Vec::new());
                         let after = victory_gpu::shader_cache::counts().0;
                         let failed_here = match &done {
                             Ok(_) => {

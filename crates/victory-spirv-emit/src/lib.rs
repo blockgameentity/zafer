@@ -24,6 +24,7 @@ pub mod emitter;
 pub mod interface;
 pub mod module;
 pub mod report;
+pub mod validate;
 pub mod symbol;
 
 pub use driver::{Translation, translate};
@@ -41,6 +42,10 @@ pub enum Error {
     /// The program uses something SPIR-V has no instruction for (yet).
     #[error("GFX10 code at {offset:#x}: {what} has no SPIR-V form")]
     Unsupported { offset: usize, what: &'static str },
+    /// The module was emitted but is not valid SPIR-V (`spirv-val`'s
+    /// finding). A module Vulkan refuses is not a translation.
+    #[error("spirv-val: {0}")]
+    Invalid(String),
     /// The translation stages before this one failed.
     #[error(transparent)]
     Shader(#[from] ShaderError),

@@ -28,6 +28,8 @@ impl<'a> Emitter<'a> {
             "s_sendmsg" if imm & 0xF == GS_ALLOC_REQ => Ok(()),
             "s_endpgm" => {
                 b.return_void();
+                // The block's exit must not add a second `OpReturn`.
+                self.returned = true;
                 Ok(())
             }
             "s_icache_inv" | "s_dcache_inv" | "s_dcache_inv_vol" => Ok(()),

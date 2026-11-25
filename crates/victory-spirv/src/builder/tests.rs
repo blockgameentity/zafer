@@ -6,6 +6,25 @@ use super::*;
 use crate::enums::StorageClass;
 use crate::parse::parse;
 
+/// Loads `bytes` with `rspirv`: a second opinion on our opcodes and operand
+/// shapes, from a crate that is not ours. Re-assembling is the loader's own
+/// statement that it understood every word it read.
+fn rspirv_loads(bytes: &[u8]) -> rspirv::dr::Module {
+    use rspirv::binary::Assemble;
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let module = rspirv::dr::load_words(words.clone()).expect("rspirv loads the module");
+    // `rspirv` stamps its own generator id (header word 2), so everything
+    // else is compared: the bound, and every instruction.
+    let again = module.assemble();
+    assert_eq!(again.len(), words.len(), "rspirv re-assembles the same words");
+    assert_eq!(&again[..2], &words[..2]);
+    assert_eq!(&again[3..], &words[3..]);
+    module
+}
+
 /// A vertex shader that writes `(x, y, 0, 1)` to `gl_Position` from two
 /// input locations, built only through the typed layer.
 fn vertex_module() -> Vec<u8> {
@@ -46,9 +65,18 @@ fn vertex_module() -> Vec<u8> {
 }
 
 #[test]
+fn rspirv_accepts_what_we_emit() {
+    let words = vertex_module();
+    let m = rspirv_loads(&words);
+    assert!(!m.functions.is_empty(), "the entry point's body is there");
+    assert!(!m.entry_points.is_empty(), "the entry point is declared");
+}
+
+#[test]
 fn a_built_module_parses() {
     let words = vertex_module();
     let instructions = parse(&words).expect("a module the builder made parses");
+    let _ = &instructions;
     assert!(instructions.iter().any(|i| i.op == Op::EntryPoint as u32));
     assert!(instructions.iter().any(|i| i.op == Op::TypeVector as u32));
     assert!(instructions.iter().any(|i| i.op == Op::Store as u32));

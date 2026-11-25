@@ -126,6 +126,14 @@ impl<'a> Emitter<'a> {
             }
             _ => return Err(unsupported(inst)),
         };
+        // A register variable holds `i32`, so a float-producing arm's result
+        // is bitcast back before the store (`spirv-val`: "pointer's type
+        // does not match object's type").
+        let result = if Self::produces_float(name) {
+            b.bitcast(i32_, result)
+        } else {
+            result
+        };
         self.store_i32(b, dst, result);
         let _ = zero;
         Ok(())

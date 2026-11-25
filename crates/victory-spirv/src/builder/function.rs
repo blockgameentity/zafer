@@ -63,6 +63,23 @@ impl Builder {
         Block { label, done: false }
     }
 
+    /// An id for a block whose `OpLabel` is written later.
+    ///
+    /// A function's blocks must appear in order, each label immediately
+    /// followed by its own body: an emitter that needs every target's id
+    /// before it writes any body (branches refer forward) reserves the ids
+    /// here and writes the labels as it reaches them with [`Builder::label`].
+    pub fn reserve_label(&mut self) -> Block {
+        let label = self.module.id();
+        Block { label, done: false }
+    }
+
+    /// Writes the `OpLabel` of the block `id`, starting its body.
+    pub fn label(&mut self, id: Id) -> Block {
+        self.module.op(Op::Label, None, Some(id), &[]);
+        Block { label: id, done: false }
+    }
+
     /// The block whose label is `label`, so an instruction can be written
     /// into a block by its id (the function's entry, after more blocks).
     pub fn at(&mut self, label: Id) -> Block {
@@ -76,7 +93,12 @@ impl Builder {
     /// declared in the entry block but the sections reorder around it, so
     /// the block only documents where it came from.
     pub fn declare_variable(&mut self, block: Id, pointer_type: Id, id: Id) -> Id {
-        self.module.op(Op::Variable, Some(pointer_type), Some(id), &[]);
+        // The storage class is an operand (`Function` here: a declared
+        // function variable is always that), and a module without it is not
+        // SPIR-V.
+        let space = crate::enums::StorageClass::Function as u32;
+        self.module
+            .op_in_function(Op::Variable, Some(pointer_type), Some(id), &[space]);
         let _ = block;
         id
     }

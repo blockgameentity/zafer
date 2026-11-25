@@ -49,6 +49,8 @@ pub mod resource;
 pub mod root;
 mod sampler;
 pub mod shader_cache;
+#[cfg(target_os = "linux")]
+pub mod spirv_cache;
 mod shadow;
 pub mod signature;
 mod texture;

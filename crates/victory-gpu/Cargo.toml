@@ -15,6 +15,7 @@ anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+victory-spirv-emit.workspace = true
 victory-vulkan.workspace = true
 sdl3-sys = { version = "0.7.3", default-features = false, features = ["no-link", "use-ash-v0-38"] }
 crc32fast.workspace = true

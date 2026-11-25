@@ -661,6 +661,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
+name = "rspirv"
+version = "0.13.0+sdk-1.4.341.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091dca2e1d6fd3098417b5ec88e77e80d1ba5945750943419dc976858082c296"
+dependencies = [
+ "rustc-hash",
+ "spirv",
+]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
 name = "rustix"
 version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -787,6 +803,15 @@ name = "smallvec"
 version = "1.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
+
+[[package]]
+name = "spirv"
+version = "0.4.0+sdk-1.4.341.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "strsim"
@@ -1044,6 +1069,7 @@ dependencies = [
  "victory-loader",
  "victory-pipeline",
  "victory-shader",
+ "victory-spirv-emit",
  "victory-vulkan",
  "victory-windows",
  "wayland-client",
@@ -1124,6 +1150,9 @@ dependencies = [
 [[package]]
 name = "victory-spirv"
 version = "0.1.0"
+dependencies = [
+ "rspirv",
+]
 
 [[package]]
 name = "victory-spirv-emit"

@@ -148,6 +148,35 @@ impl Module {
         self.op(op, Some(ty), Some(result), operands);
     }
 
+    /// Appends `op` into the function body whatever its usual section is.
+    ///
+    /// `OpVariable` is the instruction this exists for: at module scope it
+    /// belongs with the types, and inside a function it belongs in the body,
+    /// and a function-scope one written to the type section is a module
+    /// Vulkan (and `spirv-val`) rejects.
+    pub fn op_in_function(
+        &mut self,
+        op: Op,
+        result_type: Option<Id>,
+        result: Option<Id>,
+        operands: &[u32],
+    ) {
+        let mut words = 1;
+        words += usize::from(result_type.is_some());
+        words += usize::from(result.is_some());
+        words += operands.len();
+        assert!(words < 0x1_0000, "an instruction's word count is 16 bits");
+        let section = &mut self.sections[Section::Function as usize];
+        section.push((words as u32) << 16 | op as u32);
+        if let Some(t) = result_type {
+            section.push(t.0);
+        }
+        if let Some(r) = result {
+            section.push(r.0);
+        }
+        section.extend_from_slice(operands);
+    }
+
     /// Appends `op` whose only operand is `id` (branch targets, merges).
     pub fn op_id(&mut self, op: Op, id: Id) {
         self.op(op, None, None, &[id.0]);

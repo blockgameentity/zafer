@@ -23,6 +23,8 @@ pub enum Outcome {
     Emitted,
     /// The emitter has no SPIR-V form for an instruction, by mnemonic.
     Unsupported(String),
+    /// The module was emitted but `spirv-val` rejected it.
+    Invalid(String),
     /// A stage before the emitter failed.
     Earlier(String),
 }
@@ -41,6 +43,8 @@ pub struct Report {
     /// Failures from the stages before the emitter, deduplicated the same
     /// way.
     pub earlier: BTreeMap<String, usize>,
+    /// Modules `spirv-val` rejected, by its message.
+    pub invalid: BTreeMap<String, usize>,
 }
 
 impl Report {
@@ -52,6 +56,9 @@ impl Report {
                 Ok(_) => self.emitted += 1,
                 Err(Error::Unsupported { what, .. }) => {
                     *self.gaps.entry(what.to_owned()).or_default() += 1;
+                }
+                Err(Error::Invalid(why)) => {
+                    *self.invalid.entry(why).or_default() += 1;
                 }
                 Err(Error::Shader(e)) => {
                     let key = match e {
@@ -106,6 +113,7 @@ pub fn outcome(program: &NativeProgram) -> Outcome {
         Err(Error::Unsupported { what, offset }) => {
             Outcome::Unsupported(format!("{what} at {offset:#x}"))
         }
+        Err(Error::Invalid(why)) => Outcome::Invalid(why),
         Err(Error::Shader(e)) => Outcome::Earlier(e.to_string()),
     }
 }

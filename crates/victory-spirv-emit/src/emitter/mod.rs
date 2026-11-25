@@ -31,6 +31,8 @@ mod vector;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod blocks_probe;
 
 use std::collections::HashMap;
 
@@ -85,6 +87,9 @@ pub(crate) struct Emitter<'a> {
     pub(crate) glsl_set: Id,
     /// The first instruction the emitter could not translate.
     pub gap: Option<Error>,
+    /// Whether the instruction just written terminated the function
+    /// (`s_endpgm`): the block's own exit must not be written then.
+    returned: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -110,6 +115,14 @@ impl<'a> Emitter<'a> {
             for inst in &block.insts {
                 for (reg, value) in &inst.writes {
                     regs.insert(*value, *reg);
+                }
+                // A register a block *reads* needs its variable too: every
+                // `OpVariable` in a function must be among its first
+                // instructions, so none may be created lazily mid-block
+                // (`spirv-val`: "all OpVariable instructions in a function
+                // must be the first instructions in the first block").
+                for (reg, value) in &inst.reads {
+                    regs.entry(*value).or_insert(*reg);
                 }
             }
         }
@@ -137,6 +150,7 @@ impl<'a> Emitter<'a> {
             diagrams: lanes::Diagrams::new(),
             glsl_set: Id(0),
             gap: None,
+            returned: false,
         }
     }
 
@@ -163,8 +177,32 @@ impl<'a> Emitter<'a> {
         self.glsl_set = module.glsl();
         self.block = function.entry.label;
         self.function_variables(b);
-        self.labels = (0..self.ir.blocks.len()).map(|_| b.block().label).collect();
+        // Every block's id is needed before any body is written (a branch
+        // refers forward), but a function's blocks must appear in order with
+        // each label immediately followed by its own body. So the ids are
+        // reserved here and the labels written as each body starts; writing
+        // all the labels first (what this used to do) put every label after
+        // the preceding body, which `spirv-val` reports as a block that does
+        // not end with a branch.
+        //
+        // The first block is the entry block `Builder::function` already
+        // labelled, so it reuses that label: reserving one for it too left
+        // an empty, unterminated block right after `OpFunction`.
+        self.labels = (0..self.ir.blocks.len())
+            .map(|i| {
+                if i == 0 {
+                    function.entry.label
+                } else {
+                    b.reserve_label().label
+                }
+            })
+            .collect();
         for i in 0..self.ir.blocks.len() {
+            let label = self.labels[i];
+            if i > 0 {
+                b.label(label);
+            }
+            self.returned = false;
             self.block_body(b, i);
         }
         // The last block's terminator is already written; a return after it
@@ -246,7 +284,15 @@ impl<'a> Emitter<'a> {
         Some(b.inotequal(self.types.bool_, bits, zero))
     }
 
-    /// Writes an `i32` into a register.
+    /// Writes a dword into a register.
+    ///
+    /// A register variable holds `i32` (or `bool` for SCC), so a value of
+    /// any other type is bitcast before the store: Vulkan requires the
+    /// stored object's type to match the pointer's, and a float result
+    /// reaching a dword variable is what `spirv-val` reports as "pointer's
+    /// type does not match object's type". Bitcasting here rather than at
+    /// each arm means no future arm can forget it, and a store to a bool
+    /// variable still goes through [`Self::store_bit`].
     pub(crate) fn store_i32(&mut self, b: &mut Builder, reg: Reg, value: Id) {
         let var = self.var_of(b, reg);
         if reg == Reg::Scc {
@@ -302,11 +348,42 @@ impl<'a> Emitter<'a> {
                 self.store_i32(b, reg, value);
             }
         }
+        // Whether the block's terminator has been written: `s_endpgm` is a
+        // return, and the block's exit may be another.
+        let mut terminated = false;
         let insts = block.insts.clone();
         for inst in &insts {
+            // A block is over once it has been terminated. `s_endpgm` is a
+            // return, and the block's own exit is another: writing both put
+            // two `OpReturn`s in one block, which `spirv-val` rejects ("a
+            // return must appear in a block"). Instructions after a return
+            // are unreachable by construction, so dropping them loses
+            // nothing.
+            if terminated {
+                break;
+            }
             self.instruction(b, inst);
+            terminated = self.returned;
         }
-        let _ = self.exit(b, i);
+        // A block that cannot be terminated has no SPIR-V form, and a block
+        // without a terminator is invalid whatever follows: both are gaps
+        // the whole module must report, so neither may be dropped here.
+        // (`spirv-val` found this: "a block must end with a branch
+        // instruction" was the commonest refusal in the title.)
+        // `s_endpgm` already terminated this block: a second
+        // `OpReturn` in one block is what `spirv-val` reports as "a return
+        // must appear in a block".
+        if terminated {
+            return;
+        }
+        if let Err(e) = self.exit(b, i) {
+            if self.gap.is_none() {
+                self.gap = Some(e);
+            }
+            // Terminate anyway, so the rest of the module stays well formed
+            // enough for the validator to report the real problem.
+            b.return_void();
+        }
     }
 
     /// One instruction, dispatched by its encoding.

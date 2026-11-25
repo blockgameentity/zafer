@@ -160,6 +160,30 @@ fn an_exit_returns_and_a_jump_branches() {
 }
 
 #[test]
+fn a_module_the_emitter_builds_passes_spirv_val() {
+    // The emitter's own output, checked by Khronos's validator rather than
+    // by our reader: a module Vulkan refuses is not a translation.
+    let module = crate::module::Module::new(crate::module::Stage::Compute);
+    let words = module.finish("main", |b, function| {
+        let i32_ = b.int(32, true);
+        let ptr = b.pointer(victory_spirv::enums::StorageClass::Function, i32_);
+        let var = b.id();
+        b.declare_variable(function.entry.label, ptr, var);
+        let one = b.constant_i32(1);
+        b.store(var, one);
+        b.return_void();
+        b.end_function(function);
+    });
+    match crate::validate::validate(&words) {
+        crate::validate::Validity::Valid => {}
+        // A machine without the tool checked nothing, which is not a pass
+        // but is not this test's business either.
+        crate::validate::Validity::Unavailable => {}
+        crate::validate::Validity::Invalid(why) => panic!("spirv-val: {why}"),
+    }
+}
+
+#[test]
 fn every_register_is_one_function_variable() {
     // Two reads of one register load the same variable, so a write between
     // them is visible: the property the whole emitter rests on.

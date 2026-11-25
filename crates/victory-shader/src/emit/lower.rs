@@ -2170,14 +2170,73 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        // A byte or a half inside a dword: LDS is dword-addressed here, so
+        // the element is the dword that holds it, shifted and masked. A
+        // signed one is sign-extended from its own top bit.
+        let narrow = |l: &mut Self, bytes: u32, bits: u32, signed: bool| -> V {
+            let c = l.cur;
+            let o = l.s.m.i32(bytes);
+            let at = l.s.m.bin(c, Bin::Add, a, o);
+            let per = 32 / bits;
+            let k = l.s.m.i32(per - 1);
+            let slot = l.s.m.bin(c, Bin::And, at, k);
+            let step = l.s.m.i32(bits);
+            let sh = l.s.m.bin(c, Bin::Mul, slot, step);
+            let two = l.s.m.i32(2);
+            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let lds = l.s.lds();
+            let d = l.s.m.element(c, lds, index);
+            let d = l.s.m.bin(c, Bin::LShr, d, sh);
+            let keep = l.s.m.i32((1u32 << bits) - 1);
+            let x = l.s.m.bin(c, Bin::And, d, keep);
+            if !signed {
+                return x;
+            }
+            let up = l.s.m.i32(32 - bits);
+            let t = l.s.m.bin(c, Bin::Shl, x, up);
+            l.s.m.bin(c, Bin::AShr, t, up)
+        };
         if let Some(rest) = name.strip_prefix("ds_read") {
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                return Err("an LDS read of bytes or halves");
+                Vec::new()
             };
+            // Bytes and halves: `_u8`, `_i16`, and their `_d16` forms, which
+            // write one half of the VGPR (`_d16_hi` the high one).
+            let narrow_bits = match rest {
+                "_u8" | "_u8_d16" | "_u8_d16_hi" => Some((8, false)),
+                "_i8" | "_i8_d16" | "_i8_d16_hi" => Some((8, true)),
+                "_u16" | "_u16_d16" | "_u16_d16_hi" => Some((16, false)),
+                "_i16" | "_i16_d16" | "_i16_d16_hi" => Some((16, true)),
+                _ => None,
+            };
+            if let Some((bits, signed)) = narrow_bits {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let x = narrow(self, offset, bits, signed);
+                let x = if rest.ends_with("_d16_hi") {
+                    // The high half takes the value, the low half is kept.
+                    let c = self.cur;
+                    let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => self.s.m.i32(0),
+                    };
+                    let sixteen = self.s.m.i32(16);
+                    let low = self.s.m.i32(0xFFFF);
+                    let old = self.s.m.bin(c, Bin::And, old, low);
+                    let x = self.s.m.bin(c, Bin::Shl, x, sixteen);
+                    self.s.m.bin(c, Bin::Or, old, x)
+                } else {
+                    x
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
+            }
+            if elements.is_empty() {
+                return Err("an LDS read of bytes or halves");
+            }
             let reg = dst_reg.ok_or("an LDS read result")?;
             let mut n = 0;
             for (off, w) in elements {
@@ -2191,6 +2250,45 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
+            // A byte or a half is written into the dword that holds it, the
+            // other bits of the dword kept: LDS is dword-addressed here.
+            let narrow_bits = match rest {
+                "_b8" | "_b8_d16_hi" => Some(8u32),
+                "_b16" | "_b16_d16_hi" => Some(16),
+                _ => None,
+            };
+            if let Some(bits) = narrow_bits {
+                let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let c = self.cur;
+                let off = self.s.m.i32(offset);
+                let at_byte = self.s.m.bin(c, Bin::Add, a, off);
+                let two = self.s.m.i32(2);
+                let index = self.s.m.bin(c, Bin::LShr, at_byte, two);
+                let lds = self.s.lds();
+                let p = self.s.m.element(c, lds, index);
+                let per = 32 / bits;
+                let last = self.s.m.i32(per - 1);
+                let slot = self.s.m.bin(c, Bin::And, at_byte, last);
+                let step = self.s.m.i32(bits);
+                let sh = self.s.m.bin(c, Bin::Mul, slot, step);
+                let keep = self.s.m.i32((1u32 << bits) - 1);
+                let val = if rest.ends_with("_d16_hi") {
+                    let sixteen = self.s.m.i32(16);
+                    let t = self.s.m.bin(c, Bin::LShr, x, sixteen);
+                    self.s.m.bin(c, Bin::And, t, keep)
+                } else {
+                    self.s.m.bin(c, Bin::And, x, keep)
+                };
+                let at = self.begin_guarded(guard);
+                let old = self.s.m.load(self.cur, p);
+                let clear = self.s.m.i32(!((1u32 << bits) - 1));
+                let old = self.s.m.bin(c, Bin::And, old, clear);
+                let val = self.s.m.bin(c, Bin::Shl, val, sh);
+                let x = self.s.m.bin(c, Bin::Or, old, val);
+                self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -5614,8 +5712,11 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
+                    // A half the signature does not carry reads zero, as an
+                    // unprovided input channel does; refusing the shader
+                    // would lose the halves it does carry.
+                    let zero = self.s.m.i32(0);
+                    let lo = half(self, h + u8::from(attribute.high))?.unwrap_or(zero);
                     self.low_half(inst, reg, lo)
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
@@ -5669,9 +5770,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5859,7 +5957,10 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
+            // A gather at an explicit level gathers at the implicit one with
+            // the coordinates first, so only the level is dropped.
+            "image_gather4_l" => (73, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -6025,8 +6126,9 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
+                    // With a16 the bias is a half like the coordinates.
                     let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
