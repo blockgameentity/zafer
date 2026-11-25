@@ -78,6 +78,7 @@ pub fn fallback_allowed() -> bool {
 /// than being rebuilt per frame.
 pub struct Vulkan {
     presenter: std::sync::Mutex<Presenter>,
+    window: &'static crate::linux::wayland::Wayland,
 }
 
 /// The presenter, kept for the run. A `Mutex` rather than a bare value
@@ -102,15 +103,16 @@ pub fn vulkan(width: u32, height: u32) -> Result<Option<&'static Vulkan>, String
 }
 
 /// Opens the device and the window's swapchain.
+///
+/// The window is a native Wayland toplevel we own: its `wl_display` and
+/// `wl_surface` are what `vkCreateWaylandSurfaceKHR` takes, so no SDL is in
+/// this path at all. SDL keeps the gamepads ([`crate::linux::input`]) and,
+/// on a compositor-less machine, is *not* a window fallback: a title needs a
+/// surface, and this says so.
 fn open(width: u32, height: u32) -> Result<Vulkan, String> {
-    // The window has to exist first: SDL answers with the instance
-    // extensions the surface needs, and those must be enabled when the
-    // instance is created.
-    let (width, height) = match crate::linux::window(width, height) {
-        Ok(_) => crate::linux::window_pixels().unwrap_or((width.max(1), height.max(1))),
-        Err(e) => return Err(e),
-    };
-    let names = crate::linux::vulkan_instance_extensions();
+    let window = crate::linux::wayland::open("VIctory", width, height)?;
+    let (width, height) = window.size().unwrap_or((width.max(1), height.max(1)));
+    let names = crate::linux::wayland_instance_extensions();
     if names.is_empty() {
         return Err("SDL named no Vulkan instance extensions".to_owned());
     }
@@ -123,12 +125,12 @@ fn open(width: u32, height: u32) -> Result<Vulkan, String> {
         return Err("no Vulkan adapter can run the backend".to_owned());
     };
     tracing::info!(adapter = %device.name(), "Vulkan device created");
-    let instance = device.instance_handle();
-    let surface = crate::linux::vulkan_surface(instance)
-        .ok_or_else(|| "SDL made no Vulkan surface for the window".to_owned())?;
+    let surface =
+        device.wayland_surface(window.display as u64, window.surface as u64)?;
     let presenter = Presenter::open(device, surface, width, height)?;
     Ok(Vulkan {
         presenter: std::sync::Mutex::new(presenter),
+        window,
     })
 }
 
@@ -148,7 +150,10 @@ impl Vulkan {
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let mut shown = 0;
         for _ in 0..frames {
-            if let Some((width, height)) = crate::linux::window_pixels() {
+            if self.window.closed() {
+                break;
+            }
+            if let Some((width, height)) = self.window.size() {
                 presenter.resize(width, height)?;
             }
             presenter.frame(color)?;

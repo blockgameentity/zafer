@@ -29,6 +29,10 @@ victory-windows = { path = "crates/victory-windows" }
 
 # External crates
 anyhow = "1.0.104"
+# The Wayland client the window layer speaks on Linux (native, no SDL for
+# the window): `system` so `wl_display` is reachable for `VkSurfaceKHR`.
+wayland-client = { version = "0.31.15", features = ["system"] }
+wayland-protocols = { version = "0.32.13", features = ["client"] }
 # Pinned to a commit, not the crates.io release: master tracks Vulkan
 # 1.4.352 (the published 0.38 is still on 1.3.281 headers), and a `rev`
 # cannot change under us the way a branch can.

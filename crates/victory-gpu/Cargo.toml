@@ -58,6 +58,8 @@ windows = { workspace = true, features = [
 # The same D3D12 and DXGI bindings on Linux, where the host D3D12 is
 # vkd3d-proton (`victory_shader::hostlib`); named `windows` in `lib.rs`.
 [target.'cfg(not(windows))'.dependencies]
+wayland-client.workspace = true
+wayland-protocols.workspace = true
 victory-loader.workspace = true
 victory-windows.workspace = true
 windows-core.workspace = true

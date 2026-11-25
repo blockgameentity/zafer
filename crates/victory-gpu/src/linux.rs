@@ -29,6 +29,7 @@ use sdl3_sys::everything::{
 
 mod input;
 pub(crate) mod present;
+pub(crate) mod wayland;
 
 pub use input::{Pad, keys, pad, rumble};
 pub(crate) use present::SwapChain;
@@ -291,11 +292,21 @@ pub(crate) fn window(width: u32, height: u32) -> Result<usize, String> {
     Ok(made)
 }
 
-/// The instance extensions SDL needs for a surface on our window.
+/// The instance extensions our own Wayland surface needs.
 ///
-/// Every one has to be enabled when the instance is created, before the
-/// window can carry a `VkSurfaceKHR`; asking again afterwards is not
-/// allowed, so the window layer asks here and passes the list on.
+/// Native Wayland, not SDL: the surface is created by `victory-vulkan` with
+/// `vkCreateWaylandSurfaceKHR`, so the one extension required is
+/// `VK_KHR_wayland_surface` and it has to be enabled when the instance is
+/// created.
+pub(crate) fn wayland_instance_extensions() -> Vec<String> {
+    vec!["VK_KHR_wayland_surface".to_owned()]
+}
+
+/// The instance extensions SDL needs for a surface on its own window.
+///
+/// The fallback for a machine where our Wayland path has no compositor: SDL
+/// can make a surface on X11 or Wayland. Every one has to be enabled when
+/// the instance is created, before the window can carry a `VkSurfaceKHR`.
 pub(crate) fn vulkan_instance_extensions() -> Vec<String> {
     if sdl().is_none() {
         return Vec::new();

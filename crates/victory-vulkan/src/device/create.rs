@@ -19,6 +19,12 @@ pub struct Extensions {
     pub buffer_device_address: bool,
     /// `VK_EXT_descriptor_buffer`: a descriptor heap can live in a buffer.
     pub descriptor_buffer: bool,
+    /// `VK_KHR_swapchain`: a surface can be presented through the device.
+    ///
+    /// Without it `ash`'s swapchain functions are never loaded, and calling
+    /// one is a panic rather than an error — which is exactly what a window
+    /// on a real driver hit.
+    pub swapchain: bool,
 }
 
 /// The device extensions this adapter reports.
@@ -70,6 +76,26 @@ impl Device {
     pub fn instance_handle(&self) -> u64 {
         use ash::vk::Handle;
         self.instance.handle().as_raw()
+    }
+
+    /// A window surface on our own Wayland surface.
+    ///
+    /// `display` and `surface` are `wl_display`/`wl_surface` handles; the
+    /// extension is loaded here so a caller that never makes a surface never
+    /// touches it.
+    pub fn wayland_surface(&self, display: u64, surface: u64) -> Result<u64, String> {
+        use ash::vk::Handle;
+        let loader =
+            ash::khr::wayland_surface::Instance::load(crate::loader::entry()?, &self.instance);
+        let info = vk::WaylandSurfaceCreateInfoKHR::default()
+            .display(display as *mut vk::wl_display)
+            .surface(surface as *mut vk::wl_surface);
+        // SAFETY: both handles are a live `wl_display` and its `wl_surface`
+        // (the window layer keeps them for the process's life), and the
+        // instance had `VK_KHR_wayland_surface` enabled.
+        unsafe { loader.create_wayland_surface(&info, None) }
+            .map(|s| s.as_raw())
+            .map_err(|e| format!("vkCreateWaylandSurfaceKHR: {e}"))
     }
 
     /// The one queue every submission goes through.
@@ -298,6 +324,7 @@ fn open(
     // reports it, and `Device::extensions` records which came back.
     let available = available_extensions(instance, chosen.physical);
     let wanted = [
+        vk::KHR_SWAPCHAIN_NAME,
         vk::KHR_BUFFER_DEVICE_ADDRESS_NAME,
         vk::EXT_DESCRIPTOR_BUFFER_NAME,
     ];
@@ -334,7 +361,15 @@ fn open(
     let extensions = Extensions {
         buffer_device_address: features.buffer_device_address == vk::TRUE,
         descriptor_buffer: enabled.contains(&vk::EXT_DESCRIPTOR_BUFFER_NAME),
+        swapchain: enabled.contains(&vk::KHR_SWAPCHAIN_NAME),
     };
+    if !extensions.swapchain {
+        // A device that cannot present is not one this backend can use; say
+        // it here rather than panicking inside the first swapchain call.
+        // SAFETY: the device was created above and nothing else holds it.
+        unsafe { device.destroy_device(None) };
+        return Err("the adapter does not offer VK_KHR_swapchain".to_owned());
+    }
     // The two extension bits decide whether a heap can carry an address and
     // whether a descriptor heap can live in a buffer, so which way they went
     // is the first thing to look at when a title's pointer model misbehaves.

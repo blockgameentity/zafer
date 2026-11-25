@@ -64,7 +64,14 @@ pub fn rumble(slot: usize, low: u16, high: u16) {
 
 /// SDL scan codes (USB HID usages) held down while our window has the
 /// keyboard focus.
+///
+/// The window is ours ([`super::wayland`]), so the keys come from the
+/// Wayland keyboard; SDL is only asked when no Wayland window exists (the
+/// D3D12 path, which still presents through SDL's window).
 pub fn keys() -> Vec<u16> {
+    if let Some(window) = super::wayland::current() {
+        return window.keys();
+    }
     let Some(sdl) = sdl() else { return Vec::new() };
     let ours = sdl.window.load(std::sync::atomic::Ordering::Relaxed);
     // SAFETY: SDL's own state arrays, valid for its lifetime.
