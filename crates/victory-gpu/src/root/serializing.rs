@@ -1,48 +1,26 @@
-//! The host's serializers and deserializer, reached through the export of
-//! `d3d12.dll` in System32 (Linux: vkd3d-proton).
+//! Our own serializers and deserializer.
+//!
+//! These used to be reached through the export of the host's `d3d12.dll` in
+//! System32 (on Linux, vkd3d-proton). That made the root-signature path
+//! depend on a library a Linux machine need not have: the boot died when
+//! `D3D12SerializeVersionedRootSignature` answered `E_NOTIMPL` and the title
+//! threw. Both endpoints are ours ([`super::own`]), so the bytes in between
+//! are ours as well.
+
+use std::ffi::c_void;
+
 use super::*;
+use super::own;
 
-type Serialize =
-    unsafe extern "system" fn(*const Desc, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
-type SerializeVersioned =
-    unsafe extern "system" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+/// The size of a D3D12 root parameter as the title passes it (the union
+/// makes a table four dwords, a constant one and a descriptor one).
+const PARAMETER_SIZE: usize = 16;
+/// `D3D12_SAMPLER_DESC`: filter, four addresses, comparison, four bounds.
+const SAMPLER_SIZE: usize = 52;
 
-/// An export of the host's `d3d12.dll` in System32 (Linux: vkd3d-proton),
-/// looked up once.
-fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
-    *cache.get_or_init(|| {
-        #[cfg(not(windows))]
-        return match victory_shader::hostlib::d3d12_export(name) {
-            Ok(f) => Some(f as usize),
-            Err(e) => {
-                tracing::warn!("{e}");
-                None
-            }
-        };
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::System::LibraryLoader::{
-                GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-            };
-            let dll: Vec<u16> = "d3d12.dll".encode_utf16().chain([0]).collect();
-            // SAFETY: a NUL-terminated name; System32 only.
-            let module = unsafe {
-                LoadLibraryExW(
-                    dll.as_ptr(),
-                    std::ptr::null_mut(),
-                    LOAD_LIBRARY_SEARCH_SYSTEM32,
-                )
-            };
-            if module.is_null() {
-                return None;
-            }
-            // SAFETY: a loaded module and a NUL-terminated name.
-            unsafe { GetProcAddress(module, name.as_ptr().cast()) }.map(|f| f as usize)
-        }
-    })
-}
-
-/// `d3d12_xs!D3D12SerializeRootSignature`.
+/// `d3d12_xs!D3D12SerializeRootSignature`. Ignoring `version` is correct:
+/// the description is stored as given, and the only reader is our own
+/// deserializer.
 pub extern "win64" fn serialize(
     desc: *const Desc,
     version: u32,
@@ -53,26 +31,16 @@ pub extern "win64" fn serialize(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
-        tracing::warn!("no host d3d12.dll to serialize root signatures");
-        return E_NOTIMPL;
-    };
-    // SAFETY: the export has this signature; it takes what the title passed.
-    let hr = unsafe {
-        std::mem::transmute::<usize, Serialize>(address)(
-            &without_console_flags(desc),
-            version,
-            blob,
-            error,
-        )
-    };
-    #[cfg(not(windows))]
-    // SAFETY: the host filled in (or left null) the title's out pointers.
-    unsafe {
-        title::blobs(blob, error)
-    };
-    hr
+    let bytes = unsafe { own::bytes(&desc, version, PARAMETER_SIZE, SAMPLER_SIZE) };
+    tracing::debug!(
+        bytes = bytes.len(),
+        parameters = desc.parameter_count,
+        version,
+        "root signature serialized"
+    );
+    // SAFETY: the title's out pointers, which it may have left null.
+    unsafe { title::hand(&bytes, blob, error) };
+    S_OK
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -85,53 +53,37 @@ pub extern "win64" fn serialize_versioned(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
-        tracing::warn!("no host d3d12.dll to serialize root signatures");
-        return E_NOTIMPL;
-    };
-    let desc = VersionedDesc {
-        desc: without_console_flags(desc.desc),
-        ..desc
-    };
-    // SAFETY: the export has this signature; it takes what the title passed.
-    let hr =
-        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
-    #[cfg(not(windows))]
-    // SAFETY: the host filled in (or left null) the title's out pointers.
-    unsafe {
-        title::blobs(blob, error)
-    };
-    hr
+    let bytes = unsafe { own::bytes(&desc.desc, desc.version, PARAMETER_SIZE, SAMPLER_SIZE) };
+    tracing::debug!(
+        bytes = bytes.len(),
+        parameters = desc.desc.parameter_count,
+        version = desc.version,
+        "versioned root signature serialized"
+    );
+    // SAFETY: the title's out pointers, which it may have left null.
+    unsafe { title::hand(&bytes, blob, error) };
+    S_OK
 }
 
-type Deserialize =
-    unsafe extern "system" fn(*const u8, usize, *const Iid, *mut *mut c_void) -> HRESULT;
-
-/// `d3d12_xs!D3D12CreateRootSignatureDeserializer`: our blobs are the
-/// host's serialization, so the host's deserializer reads them, and its
-/// object (IUnknown, then the description getter) is laid out as the
-/// console's. Grand Theft Auto VI's upscaler asks with the PC interface id.
+/// `d3d12_xs!D3D12CreateRootSignatureDeserializer`: the blob is ours, so the
+/// description it carries is the one the title wrote, read straight back.
 pub extern "win64" fn create_deserializer(
     blob: *const u8,
     size: usize,
     iid: *const Iid,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    if blob.is_null() || out.is_null() {
+    if blob.is_null() || out.is_null() || size == 0 {
         return E_INVALIDARG;
     }
-    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12CreateRootSignatureDeserializer") else {
-        tracing::warn!("no host d3d12.dll to deserialize root signatures");
-        return E_NOTIMPL;
-    };
-    // SAFETY: the export has this signature; it takes what the title passed.
-    let hr = unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) };
-    #[cfg(not(windows))]
-    // SAFETY: the host filled in (or left null) the title's out pointer.
-    unsafe {
-        title::deserializer(out)
-    };
-    hr
+    // SAFETY: the title passes its blob and its length.
+    let bytes = unsafe { std::slice::from_raw_parts(blob, size) };
+    if !own::is_ours(bytes) {
+        // A blob from the host, if one ever reaches us: nothing to read.
+        tracing::warn!(size, "root signature blob is not ours");
+        return E_INVALIDARG;
+    }
+    // SAFETY: `out` is the title's writable pointer.
+    unsafe { title::deserialize(bytes, iid, out) };
+    S_OK
 }

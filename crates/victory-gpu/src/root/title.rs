@@ -1,18 +1,18 @@
-//! The host's blobs and deserializers as objects the title can call
-//! (`win64`), on Linux where the host's are SysV.
+//! Our blobs and deserializers as objects the title can call (`win64`).
+//!
+//! These used to wrap a host object and copy its bytes out. Now the bytes are
+//! ours from the start ([`super::own`]), so an object here owns a `Vec<u8>`
+//! and, for a deserializer, the description pointing into it.
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
-use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
-use windows::core::Interface;
+use super::own;
+use crate::object::{HRESULT, Iid, S_OK};
 
-use crate::object::{HRESULT, S_OK};
-
-/// IUnknown, then the object's one getter (the blob's two).
+/// IUnknown, then the object's accessors (a blob's two, a deserializer's one).
 #[repr(C)]
 struct Vtable {
-    query: extern "win64" fn(*mut Title, *const c_void, *mut *mut c_void) -> HRESULT,
+    query: extern "win64" fn(*mut Title, *const Iid, *mut *mut c_void) -> HRESULT,
     add_ref: extern "win64" fn(*mut Title) -> u32,
     release: extern "win64" fn(*mut Title) -> u32,
     first: extern "win64" fn(*mut Title) -> *const c_void,
@@ -23,15 +23,12 @@ struct Vtable {
 struct Title {
     vtable: &'static Vtable,
     refs: AtomicU32,
-    /// The blob's bytes; empty for a deserializer.
+    /// The blob's bytes, or the bytes a deserializer reads its description
+    /// from. Owned here, so `description`'s pointers stay valid.
     bytes: Vec<u8>,
-    /// The deserializer's description, which `host` owns.
-    desc: *const c_void,
-    _host: Option<ID3D12RootSignatureDeserializer>,
 }
 
-extern "win64" fn query(this: *mut Title, _: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    // Any interface: the title only asks for the one it was given.
+extern "win64" fn query(this: *mut Title, _: *const Iid, out: *mut *mut c_void) -> HRESULT {
     add_ref(this);
     // SAFETY: the title's out pointer.
     unsafe { *out = this.cast() };
@@ -65,8 +62,10 @@ extern "win64" fn size(this: *mut Title) -> usize {
 }
 
 extern "win64" fn desc(this: *mut Title) -> *const c_void {
-    // SAFETY: as above.
-    unsafe { (*this).desc }
+    // SAFETY: a live object of ours, whose bytes outlive the description.
+    unsafe { own::description(&(*this).bytes) }
+        .map(|d| &d as *const _ as *const c_void)
+        .unwrap_or(std::ptr::null())
 }
 
 static BLOB: Vtable = Vtable {
@@ -85,60 +84,41 @@ static DESERIALIZER: Vtable = Vtable {
     second: size,
 };
 
-fn hand_out(title: Title) -> *mut c_void {
-    Box::into_raw(Box::new(title)).cast()
+fn hand_out(blob: Title) -> *mut c_void {
+    Box::into_raw(Box::new(blob)).cast()
 }
 
-/// Replaces the host blobs at `blob` and `error` (each null or not)
-/// with copies of ours.
+/// Replaces the title's out pointers with blobs of ours carrying `bytes`.
 ///
 /// # Safety
 ///
-/// Each is null or points at null or a host blob reference, now ours.
-pub(super) unsafe fn blobs(blob: *mut *mut c_void, error: *mut *mut c_void) {
+/// Each is null or points at a writable `*mut c_void`.
+pub(super) unsafe fn hand(bytes: &[u8], blob: *mut *mut c_void, error: *mut *mut c_void) {
     for at in [blob, error] {
         // SAFETY: the caller's pointers.
-        let Some(host) = (unsafe { at.as_mut() }).filter(|h| !h.is_null()) else {
+        let Some(out) = (unsafe { at.as_mut() }) else {
             continue;
         };
-        // SAFETY: a host blob reference, now released by the drop.
-        let blob = unsafe { ID3DBlob::from_raw(*host) };
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                blob.GetBufferPointer().cast::<u8>(),
-                blob.GetBufferSize(),
-            )
-        };
-        *host = hand_out(Title {
+        *out = hand_out(Title {
             vtable: &BLOB,
             refs: AtomicU32::new(1),
             bytes: bytes.to_vec(),
-            desc: std::ptr::null(),
-            _host: None,
         });
     }
 }
 
-/// Replaces the host deserializer at `out` with one of ours.
+/// Writes a deserializer of ours over `bytes` at `out`.
 ///
 /// # Safety
 ///
-/// As for [`blobs`], with a deserializer.
-pub(super) unsafe fn deserializer(out: *mut *mut c_void) {
+/// `out` is writable, and `bytes` outlives nothing on our side: it is copied.
+pub(super) unsafe fn deserialize(bytes: &[u8], _iid: *const Iid, out: *mut *mut c_void) {
     // SAFETY: the caller's pointer.
-    let Some(host) = (unsafe { out.as_mut() }).filter(|h| !h.is_null()) else {
-        return;
+    unsafe {
+        *out = hand_out(Title {
+            vtable: &DESERIALIZER,
+            refs: AtomicU32::new(1),
+            bytes: bytes.to_vec(),
+        })
     };
-    // SAFETY: a host deserializer reference, now held by our object.
-    let host_object = unsafe { ID3D12RootSignatureDeserializer::from_raw(*host) };
-    // SAFETY: a plain getter; the description lives as long as the object.
-    let desc = unsafe { host_object.GetRootSignatureDesc() }.cast();
-    *host = hand_out(Title {
-        vtable: &DESERIALIZER,
-        refs: AtomicU32::new(1),
-        bytes: Vec::new(),
-        desc,
-        _host: Some(host_object),
-    });
 }

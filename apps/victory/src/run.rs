@@ -151,6 +151,20 @@ pub fn run(
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
     // SAFETY: imports are bound; from here on we run title code.
+    // The host GPU backend, before any title frame: Vulkan unless
+    // `VICTORY_BACKEND=d3d12`. The window and swapchain come up here, and
+    // `VICTORY_BACKEND=vulkan` fails the boot rather than quietly running
+    // D3D12.
+    match victory_gpu::backend::start(1280, 720) {
+        Ok(backend) => {
+            println!("backend        {}", backend.name());
+            if let Err(e) = victory_gpu::backend::present_boot_frame(backend) {
+                eprintln!("VIctory: first Vulkan frame failed: {e}");
+            }
+        }
+        Err(e) => return Err(anyhow::anyhow!("{e}")),
+    }
+    // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     // A title whose main thread never returns must not hang the process: the
     // exception path below reports the fault and then waits for a thread

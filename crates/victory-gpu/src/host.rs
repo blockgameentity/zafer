@@ -3,6 +3,13 @@
 //! (`victory_shader::hostlib`) and the window and swap chain are in
 //! [`crate::linux`].
 //!
+//! This is the fallback backend, not the default one: a run starts on
+//! Vulkan ([`crate::backend`]) unless `VICTORY_BACKEND=d3d12` says
+//! otherwise or the machine cannot present on Vulkan. The console's own
+//! draws still arrive here until the Vulkan milestones in
+//! `docs/vulkan-backend.md` land, so a Vulkan run presents its frames and
+//! hands the title's rendering to this device.
+//!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 

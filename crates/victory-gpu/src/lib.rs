@@ -1,4 +1,4 @@
-//! D3D12.X on host D3D12.
+//! D3D12.X on host D3D12, or on Vulkan ([`backend`], the default).
 //!
 //! D3D12.X records commands from code inlined into the title, which writes
 //! packets into the command list while its put pointer is below a limit and
@@ -21,6 +21,11 @@ extern crate victory_windows as windows;
 
 #[cfg(feature = "diagnostics")]
 mod capture;
+#[cfg(not(windows))]
+pub mod backend;
+#[cfg(windows)]
+#[path = "backend_windows.rs"]
+pub mod backend;
 pub mod console;
 #[cfg(feature = "diagnostics")]
 mod copystat;

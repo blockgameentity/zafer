@@ -1,10 +1,16 @@
 # The Vulkan backend
 
-Status: planned. Nothing here is implemented. `crates/victory-gpu/src/vulkan/`
-and `crates/victory-shader/src/spirv/` do not exist yet; what runs today is
-the D3D12 backend (`crates/victory-gpu/src/host.rs`) on vkd3d-proton
-(`crates/victory-shader/src/hostlib.rs`), with DXIL from
-`crates/victory-shader/src/emit/`.
+Status: in progress, and Vulkan is the default backend. `victory-vulkan` has
+the loader, adapters, device, swapchain and a presenter that acquires,
+clears, submits and presents a real window
+(`crates/victory-vulkan/src/presenter.rs`), and `victory-gpu::backend` picks
+it unless `VICTORY_BACKEND=d3d12` says otherwise. So milestones 1 and 2 of
+the work order below are wired up; the console's draws are still on the
+D3D12 host (`crates/victory-gpu/src/host.rs`) over vkd3d-proton
+(`crates/victory-shader/src/hostlib.rs`) with DXIL from
+`crates/victory-shader/src/emit/`, which is what milestones 4-7 replace.
+`VICTORY_BACKEND=vulkan` refuses the fallback so a Vulkan bug is never
+hidden by a silent downgrade.
 
 ## Why
 
@@ -158,7 +164,9 @@ order is the order in which a wrong assumption is cheapest to find.
    the D3D12 tests do.
 2. **Swapchain, present a cleared screen.** Files: `vulkan/{swapchain,present}.rs`,
    `linux.rs` (SDL3 surface). Present a clear through a real swapchain and a
-   timeline semaphore, no title involved.
+   timeline semaphore, no title involved. *(Done: `presenter.rs`, with binary
+   semaphores and one fence; `backend::present_boot_frame` proves it at
+   boot.)*
    Exit: a window shows the clear colour for N frames, and a resize does not
    crash.
 3. **One pipeline from a translated SPIR-V shader, one draw.** Files:

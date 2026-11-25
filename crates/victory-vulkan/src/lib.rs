@@ -17,6 +17,7 @@ pub mod heap;
 pub mod instance;
 pub mod loader;
 pub mod present;
+pub mod presenter;
 pub mod query;
 pub mod resource;
 pub mod swapchain;
@@ -36,6 +37,7 @@ mod instance_tests;
 #[cfg(test)]
 mod swapchain_tests;
 
+pub use presenter::Presenter;
 pub use instance::{
     Info, SURFACE_EXTENSION, available, instance_extensions, loader_version, probe,
 };

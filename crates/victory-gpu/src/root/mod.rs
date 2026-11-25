@@ -12,17 +12,21 @@ use std::ffi::{CStr, c_void};
 use std::sync::OnceLock;
 
 use crate::object::{
-    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This, guid,
+    self, E_INVALIDARG, HRESULT, Iid, Object, ROOT_SIGNATURE, S_OK, Table, This, guid,
 };
 use crate::resource::PAGEABLE_IIDS;
 
 mod create;
 mod descriptions;
+mod own;
 mod serializing;
 #[cfg(not(windows))]
 mod title;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "own_tests.rs"]
+mod own_tests;
 
 pub(crate) use create::*;
 pub use serializing::*;

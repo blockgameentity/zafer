@@ -7,7 +7,7 @@
 pub mod object;
 mod policy;
 
-pub use object::{Status, Swapchain};
+pub use object::{Status, Surface, Swapchain};
 pub use policy::{
     choose_format, choose_present_mode, composite_alpha, enclosing_extent, image_count,
 };

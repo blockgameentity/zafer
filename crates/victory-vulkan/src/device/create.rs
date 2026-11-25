@@ -65,6 +65,13 @@ impl Device {
         &self.instance
     }
 
+    /// The instance as a raw `VkInstance`, for a window layer that only
+    /// knows C handles (SDL makes the surface, and takes the number).
+    pub fn instance_handle(&self) -> u64 {
+        use ash::vk::Handle;
+        self.instance.handle().as_raw()
+    }
+
     /// The one queue every submission goes through.
     pub fn queue(&self) -> vk::Queue {
         self.queue
