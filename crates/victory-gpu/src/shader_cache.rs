@@ -32,7 +32,7 @@ pub fn use_shader_cache(dir: PathBuf) {
 }
 
 /// Shaders found in the cache and translated since the start.
-pub(crate) fn counts() -> (u64, u64) {
+pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
@@ -67,9 +67,24 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Whether `container` already has a translation in the cache this process
+/// reads — answered without translating, so a warm-up can skip a container
+/// entirely instead of paying for the work it is checking for.
+pub fn is_cached(container: &[u8]) -> bool {
+    let Some(cache) = CACHE.get() else {
+        return false;
+    };
+    let input = [&build()[..], container].concat();
+    let probe = Translate {
+        translate: |_: &[u8]| Err("probe".to_string()),
+        ran: AtomicBool::new(false),
+    };
+    cache.lookup(&probe, &input).is_some()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+pub fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),

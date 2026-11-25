@@ -75,10 +75,17 @@
         ++ lib.optionals (has pkgs "dxvk") [ pkgs.dxvk ];
 
       # Build tooling: crates that link C, and vkd3d-proton (meson/ninja/glslang).
+      # `mold` is the linker the dev shell selects (`-fuse-ld=mold`) and
+      # `sccache` is the compiler cache behind `RUSTC_WRAPPER`; both are for
+      # interactive builds only (a Nix sandbox has neither a cache daemon nor
+      # the system linker they need), so they are named here but not used by
+      # the package or test derivations below.
       buildTools =
         pkgs:
         [
           pkgs.pkg-config
+          pkgs.mold
+          pkgs.sccache
           pkgs.cmake
           pkgs.ninja
           pkgs.meson
@@ -200,12 +207,21 @@
         ''}
         export VKD3D_SHADER_CACHE_PATH="''${XDG_CACHE_HOME:-$HOME/.cache}/vkd3d-proton"
 
+        # sccache cannot write into a store path, so its cache lives in the
+        # user cache directory; mold is the linker every cargo invocation in
+        # this shell uses. Neither reaches the sandboxed derivations.
+        export SCCACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/sccache"
+        mkdir -p "$SCCACHE_DIR"
+        export RUSTC_WRAPPER=sccache
+        export RUSTFLAGS="-C link-arg=-fuse-ld=mold''${RUSTFLAGS:+ $RUSTFLAGS}"
+
         echo "VIctory dev shell - Rust $(rustc --version 2>/dev/null | cut -d' ' -f2), Linux runtime deps in LD_LIBRARY_PATH"
         echo "  SDL3:            $SDL3 (also VICTORY_SDL3)"
         echo "  VK_ICD_FILENAMES / VK_LAYER_PATH: left for you to set"
         echo "  vkd3d-proton:    meson setup build --buildtype=release --prefix=\"$HOME/.local/vkd3d-proton\" && ninja -C build install"
         echo "  then:            export VICTORY_VKD3D=\"$HOME/.local/vkd3d-proton/lib\"  # libvkd3d-proton-d3d12core.so"
         echo "  (${nixpkgsHint pkgs})"
+        echo "  build:           sccache (RUSTC_WRAPPER, cache in $SCCACHE_DIR), mold (-fuse-ld=mold)"
         echo "  shader tools:    spirv-val spirv-dis spirv-as glslangValidator vulkaninfo"
         echo "  optional:        export VICTORY_DXIL=~/.local/dxc/lib/libdxil.so VICTORY_DXCOMPILER=~/.local/dxc/lib/libdxcompiler.so"
         echo "  tests with a device: VICTORY_VKD3D=... cargo test -p victory-shader --features host -p victory-gpu"

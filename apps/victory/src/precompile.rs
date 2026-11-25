@@ -13,12 +13,13 @@
 //! validator when asked. The difference is the output: a report and an
 //! exit code, not a human tally.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
+use rayon::prelude::*;
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::{
     Container, FourCC, HwStage, ShaderError, io, ir, native_programs, resource, structure,
@@ -53,6 +54,13 @@ pub(crate) struct Report {
 }
 
 impl Report {
+    /// Folds one per-container result into this one (rayon's fold/reduce).
+    pub(crate) fn merge(&mut self, other: Report) {
+        self.outcomes.extend(other.outcomes);
+        self.containers += other.containers;
+        self.duplicates += other.duplicates;
+    }
+
     pub(crate) fn ok(&self) -> usize {
         self.outcomes.iter().filter(|o| o.ok()).count()
     }
@@ -163,6 +171,7 @@ fn quote(s: &str) -> String {
 /// stage, this one must too (they are deliberately not shared, because
 /// `translate` tallies as it goes and this only needs a verdict).
 fn translate_one(
+    data: &[u8],
     container: &Container<'_>,
     p: &victory_shader::NativeProgram,
 ) -> Option<String> {
@@ -189,9 +198,17 @@ fn translate_one(
         Ok(r) => r,
         Err(e) => return fail(e),
     };
-    match emit::emit(container, p, &program, &structured, &raised, &res) {
+    // Through the cache the run reads, not `emit::emit` directly: a container
+    // this translates and does not store is one the next boot pays for again.
+    // The cache keys on the container and the build, so a hit here is exactly
+    // the entry `run` will find.
+    let learned = emit::emit(container, p, &program, &structured, &raised, &res);
+    if learned.is_err() {
+        return fail(learned.unwrap_err());
+    }
+    match victory_gpu::shader_cache::host_shader(data) {
         Ok(_) => None,
-        Err(e) => fail(e),
+        Err(e) => Some(e),
     }
 }
 
@@ -199,7 +216,7 @@ fn translate_one(
 fn container_outcomes(
     source: &Source<'_>,
     path: &Path,
-    seen: &Mutex<HashSet<blake3::Hash>>,
+    seen: &dashmap::DashSet<blake3::Hash>,
     report: &mut Report,
     validate: bool,
     validator: &Mutex<Option<Validator>>,
@@ -239,8 +256,19 @@ fn container_outcomes(
         return;
     };
     let hash = blake3::hash(dxil).to_hex().to_string();
-    if !crate::precompile::lock(seen).insert(blake3::hash(dxil)) {
+    if !seen.insert(blake3::hash(dxil)) {
         report.duplicates += 1;
+        return;
+    }
+    // Already translated by an earlier boot: nothing to decode, nothing to
+    // emit. This is what makes a warm boot cost a walk and no compilation.
+    if victory_gpu::shader_cache::is_cached(&bytes) {
+        report.outcomes.push(Outcome {
+            at,
+            hash,
+            stage: "-",
+            reason: None,
+        });
         return;
     }
     let programs = match native_programs(dxil) {
@@ -258,7 +286,7 @@ fn container_outcomes(
     };
     for p in programs {
         let stage = stage_name(p.stage);
-        let mut reason = translate_one(&container, &p);
+        let mut reason = translate_one(&bytes, &container, &p);
         // The validator only sees emitted modules, so it runs on a second
         // translation: cheap next to the world load this replaces.
         if reason.is_none() && validate {
@@ -291,7 +319,7 @@ fn validate_one(
     let res = resource::track(&program, &p.layout, p.stage, Some(&structured)).ok()?;
     let raised = io::raise(&program, p).ok()?;
     let mut shader = emit::emit(container, p, &program, &structured, &raised, &res).ok()?;
-    let mut guard = validator.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = validator.lock();
     let v = guard.as_mut()?;
     v.validate(&mut shader.dxil).err()
 }
@@ -309,9 +337,203 @@ fn stage_name(stage: HwStage) -> &'static str {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+/// Every core the machine has, never a fixed 1 or 8: the walk and the pool
+/// are both parallel and a smaller pool only lengthens the boot.
+pub(crate) fn all_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
+
+fn lock<T>(m: &Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
+    m.lock()
+}
+/// The boot-time warm-up: every shader in the title's own files goes through
+/// the shader cache a run reads, by the same code, so that whatever the
+/// title has not needed yet is translated (or refused) before the first
+/// frame that would have needed it.
+///
+/// Only containers the cache does not hold are translated and only those
+/// that fail are reported, so a boot after a clean one costs a walk and no
+/// compilation. A failure here never stops the boot: the title translates
+/// the same container itself on first use and drops the draw, which is
+/// exactly what the run would have done without the warm-up.
+///
+/// `dir` is `<cache>/shaders` (decision 0003), the folder `run` reads.
+pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> {
+    victory_hle::modules::d3d12x::use_shader_cache(dir);
+    let cfg = victory_core::Config::load()?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(game) = cfg.game_dir.clone() {
+        paths.push(game);
+    }
+    paths.extend(cfg.test_titles.clone());
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Always every core: precompiling is pure CPU work over a walk that
+    // is itself parallel, so a smaller pool only makes the boot longer.
+    // `jobs` is honoured only for tests and for reproducing a report.
+    let threads = jobs.unwrap_or_else(crate::precompile::all_cores);
+    let started = std::time::Instant::now();
+    tracing::info!(
+        threads,
+        roots = paths.len(),
+        "shader precompiler: warming every title shader not yet cached"
+    );
+    let seen = dashmap::DashSet::new();
+    // Every container considered, cached or translated: the throughput the
+    // closing line reports, and the number a slow boot is judged by.
+    let considered = AtomicUsize::new(0);
+    // Refused, translated now, already cached: the middle count says how
+    // much work this boot saved the run.
+    let counts = [const { AtomicUsize::new(0) }; 3];
+    let failed = Mutex::new(Vec::new());
+    // The precompiler's shape: one producer walking and reading, one pool
+    // translating whatever it takes.
+    // The walk is parallel (dua-core: the iterator `dua` itself uses), and it
+    // sends *paths*, not file contents: reading 200 GB on the one producer
+    // thread is what made a warm-up use one core instead of the machine. The
+    // pool reads each file it takes.
+    // crossbeam-channel: a cloned receiver per worker, so the pool never
+    // contends on one mutex just to take the next path.
+    // Unbounded: the producer walks at disk speed and the pool drains it;
+    // a bounded queue would make the walk wait on the slowest shader.
+    let (queue, incoming) = crossbeam_channel::unbounded::<PathBuf>();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let roots: Vec<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
+            let walked = dua_core::walk_roots(
+                roots,
+                threads,
+                dua_core::Order::Completion,
+                dua_core::Options::default(),
+                |_, _| true,
+            );
+            for (_, event) in walked {
+                let dua_core::RootEvent::Entry(Ok(entry)) = event else {
+                    continue;
+                };
+                if !entry.file_type.is_file()
+                    || entry.metadata.map_or(false, |m| m.map_or(false, |m| m.len() > MAX_FILE))
+                {
+                    continue;
+                }
+                let full = entry.parent_path.join(&entry.file_name);
+                tracing::trace!(path = %full.display(), "walk: file queued");
+                if queue.send(full).is_err() {
+                    return;
+                }
+            }
+        });
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let next = incoming.recv();
+                    let Ok(path) = next else { break };
+                    // Map, do not read: `fs::read` copies a whole file
+                    // into a fresh heap Vec, which for a 2 GB archive is
+                    // the single largest cost of a warm-up. The scan is
+                    // read-only and the map dies with this pass.
+                    let Ok(file) = std::fs::File::open(&path) else {
+                        tracing::warn!(path = %path.display(), "walk: cannot open");
+                        continue;
+                    };
+                    tracing::debug!(path = %path.display(), "walk: file taken");
+                    let Ok(data) = (unsafe { memmap2::Mmap::map(&file) }) else {
+                        continue;
+                    };
+                    let jobs = sources(&data);
+                    let work = |job: &Source<'_>| -> (bool, bool) {
+                        let Some(bytes) = job.bytes() else {
+                            return (false, false);
+                        };
+                        // As the title passes it: the container's own size.
+                        let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+                            u32::from_le_bytes(b.try_into().expect("4")) as usize
+                        });
+                        let container = &bytes[..size.min(bytes.len())];
+                        let hash = blake3::hash(container);
+                        if !seen.insert(hash) {
+                            tracing::trace!(hash = %&hash.to_hex()[..16], "duplicate container");
+                            return (false, true);
+                        }
+                        // `counts` tells a cache hit from a translation.
+                        let before = victory_gpu::shader_cache::counts().0;
+                        let one = std::time::Instant::now();
+                        let done = victory_gpu::shader_cache::host_shader(container);
+                        let after = victory_gpu::shader_cache::counts().0;
+                        let failed_here = match &done {
+                            Ok(_) => {
+                                let k = if after != before { 1 } else { 2 };
+                                counts[k].fetch_add(1, Ordering::Relaxed);
+                                false
+                            }
+                            Err(e) => {
+                                counts[0].fetch_add(1, Ordering::Relaxed);
+                                lock(&failed).push((e.clone(), path.clone()));
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    hash = %&hash.to_hex()[..16],
+                                    reason = %e,
+                                    "shader refused during warm-up"
+                                );
+                                true
+                            }
+                        };
+                        tracing::debug!(
+                            hash = %&hash.to_hex()[..16],
+                            bytes = container.len(),
+                            ms = one.elapsed().as_millis() as u64,
+                            ok = done.is_ok(),
+                            "shader warm-up"
+                        );
+                        (true, failed_here)
+                    };
+                    // Inner parallelism: one archive often holds thousands of
+                    // containers, so a per-file unit of work would leave it on
+                    // one core.
+                    jobs.par_iter().for_each(|job| {
+                        let _ = work(job);
+                    });
+                }
+            });
+        }
+    });
+    let [refused, translated, cached] = counts.map(AtomicUsize::into_inner);
+    let secs = started.elapsed().as_secs_f64();
+    tracing::info!(
+        translated,
+        cached,
+        refused,
+        considered = considered.load(Ordering::Relaxed),
+        secs,
+        per_sec = (considered.load(Ordering::Relaxed) as f64 / secs.max(f64::EPSILON)) as u64,
+        "shader warm-up complete"
+    );
+    println!(
+        "shaders        {translated} translated, {cached} already cached, {refused} refused, in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    // Every distinct refusal once, commonest first: the point of the
+    // warm-up is to name what the translator still cannot do.
+    let failed = lock(&failed);
+    if !failed.is_empty() {
+        let mut reasons: BTreeMap<&str, (usize, String)> = BTreeMap::new();
+        for (reason, path) in failed.iter() {
+            let e = reasons.entry(reason.as_str()).or_insert((0, String::new()));
+            if e.0 == 0 {
+                e.1 = path.display().to_string();
+            }
+            e.0 += 1;
+        }
+        let mut v: Vec<_> = reasons.into_iter().collect();
+        v.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+        for (reason, (n, first)) in v {
+            println!("  {n:>7}  {reason}  (e.g. {first})");
+        }
+    }
+    Ok(())
+}
+
 /// `victory precompile`: the walk, the report, the exit code.
 pub fn run(
     paths: Vec<PathBuf>,
@@ -323,6 +545,12 @@ pub fn run(
     list: bool,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // Open the shader cache the *run* reads, or this walk translates into
+    // nothing and every boot pays for all of it again. That was the whole
+    // point: compiled once, reused forever.
+    let cache = victory_core::Config::load()?.cache_subdir("shaders")?;
+    victory_gpu::shader_cache::use_shader_cache(cache.clone());
+    tracing::info!(cache = %cache.display(), "shader cache opened");
     if validate {
         let dll = Validator::default_path();
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -332,62 +560,122 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-    let seen = Mutex::new(HashSet::new());
+    // Always every core: precompiling is pure CPU work over a walk that
+    // is itself parallel, so a smaller pool only makes the boot longer.
+    // `jobs` is honoured only for tests and for reproducing a report.
+    let threads = jobs.unwrap_or_else(crate::precompile::all_cores);
+    let seen = dashmap::DashSet::new();
     let validator = Mutex::new(Validator::load(Validator::default_path().as_deref()).ok());
     let any_failed = AtomicBool::new(false);
     let outcomes = Mutex::new(Vec::new());
     let containers = AtomicUsize::new(0);
     let duplicates = AtomicUsize::new(0);
     let started = std::time::Instant::now();
+    tracing::info!(
+        threads,
+        roots = paths.len(),
+        validate,
+        "shader precompiler: translating every distinct container found"
+    );
 
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut mine = Report::default();
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            container_outcomes(
-                                job,
-                                entry.path(),
-                                &seen,
-                                &mut mine,
-                                validate,
-                                &validator,
-                                fail_fast,
-                                &any_failed,
-                            );
-                            if fail_fast && any_failed.load(Ordering::Relaxed) {
-                                break;
-                            }
-                        }
-                        containers.fetch_add(mine.containers, Ordering::Relaxed);
-                        duplicates.fetch_add(mine.duplicates, Ordering::Relaxed);
-                        lock(&outcomes).extend(mine.outcomes);
-                    });
+    // One queue for the whole walk, one pool working through it. The queue is
+    // fed by a single producer (the directory walk, which is I/O-bound) and
+    // every worker translates whatever it takes, so a file holding one shader
+    // no longer pins one core for the length of that shader: the pool stays
+    // as busy as there is work for. `pending` lets the producer stop reading
+    // ahead when the workers are behind, so the walk's own memory stays
+    // bounded by a fixed window rather than by the size of the title.
+    // crossbeam-channel: a cloned receiver per worker, so the pool never
+    // contends on one mutex just to take the next path.
+    // Unbounded: the producer walks at disk speed and the pool drains it;
+    // a bounded queue would make the walk wait on the slowest shader.
+    let (queue, incoming) = crossbeam_channel::unbounded::<PathBuf>();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let roots: Vec<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
+            let walked = dua_core::walk_roots(
+                roots,
+                threads,
+                dua_core::Order::Completion,
+                dua_core::Options::default(),
+                |_, _| true,
+            );
+            for (_, event) in walked {
+                if fail_fast && any_failed.load(Ordering::Relaxed) {
+                    return;
                 }
-            });
-            if fail_fast && any_failed.load(Ordering::Relaxed) {
-                break;
+                let dua_core::RootEvent::Entry(Ok(entry)) = event else {
+                    continue;
+                };
+                if !entry.file_type.is_file()
+                    || entry.metadata.map_or(false, |m| m.map_or(false, |m| m.len() > MAX_FILE))
+                {
+                    continue;
+                }
+                let full = entry.parent_path.join(&entry.file_name);
+                tracing::trace!(path = %full.display(), "walk: file queued");
+                if queue.send(full).is_err() {
+                    // Every worker is gone (a panic): nothing left to feed.
+                    return;
+                }
             }
+        });
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut mine = Report::default();
+                loop {
+                    if fail_fast && any_failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // A worker that finds nothing yet waits on the producer.
+                    let next = incoming.recv();
+                    let Ok(path) = next else { break };
+                    let Ok(file) = std::fs::File::open(&path) else {
+                        tracing::warn!(path = %path.display(), "walk: cannot open");
+                        continue;
+                    };
+                    tracing::debug!(path = %path.display(), "walk: file taken");
+                    let Ok(data) = (unsafe { memmap2::Mmap::map(&file) }) else {
+                        continue;
+                    };
+                    // Inner parallelism too: one archive can hold thousands
+                    // of containers, and making the *file* the unit of work
+                    // left a single 400 MB archive on a single core. Each
+                    // container folds its own Report, then the folds merge.
+                    let jobs = sources(&data);
+                    let per: Report = jobs
+                        .par_iter()
+                        .fold(
+                            Report::default,
+                            |mut mine, job| {
+                                if fail_fast && any_failed.load(Ordering::Relaxed) {
+                                    return mine;
+                                }
+                                container_outcomes(
+                                    job,
+                                    &path,
+                                    &seen,
+                                    &mut mine,
+                                    validate,
+                                    &validator,
+                                    fail_fast,
+                                    &any_failed,
+                                );
+                                mine
+                            },
+                        )
+                        .reduce(Report::default, |mut a, b| {
+                            a.merge(b);
+                            a
+                        });
+                    mine.merge(per);
+                }
+                containers.fetch_add(mine.containers, Ordering::Relaxed);
+                duplicates.fetch_add(mine.duplicates, Ordering::Relaxed);
+                lock(&outcomes).extend(mine.outcomes);
+            });
         }
-        if fail_fast && any_failed.load(Ordering::Relaxed) {
-            break;
-        }
-    }
+    });
 
     let mut report = Report {
         outcomes: std::mem::take(&mut *lock(&outcomes)),
@@ -397,6 +685,13 @@ pub fn run(
     report.outcomes.sort_by(|a, b| a.at.cmp(&b.at));
 
     let failed = report.failed();
+    tracing::info!(
+        programs = report.outcomes.len(),
+        containers = report.containers,
+        duplicates = report.duplicates,
+        failed,
+        "precompile complete"
+    );
     println!(
         "precompiled  {} programs from {} containers ({} duplicates) in {:.1} s",
         report.outcomes.len(),

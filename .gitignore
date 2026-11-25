@@ -78,3 +78,6 @@ Thumbs.db
 .DS_Store
 # vkd3d-proton's pipeline cache, written to the working directory (Linux)
 vkd3d-proton.cache*
+
+# direnv + nix-direnv: the local dev shell's cache, never committed
+.direnv/

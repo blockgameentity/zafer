@@ -44,6 +44,14 @@ impl Cache {
         self.root.join(&hex[..2]).join(&hex[2..])
     }
 
+    /// The cached output for `input` if it is already there, without
+    /// converting anything. A warm-up asks this first: on a hit it must not
+    /// pay for the work the cache exists to avoid.
+    pub fn lookup(&self, converter: &dyn Converter, input: &[u8]) -> Option<PathBuf> {
+        let path = self.path_for(&CacheKey::new(converter, input));
+        path.is_file().then_some(path)
+    }
+
     /// Returns the cached output for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
