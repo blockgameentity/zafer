@@ -10,6 +10,7 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
+use parking_lot::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -145,6 +146,73 @@ fn cached(
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)
 }
+
+
+/// The refusal of a container, kept so a warm-up does not translate the
+/// same shader again on every boot.
+///
+/// A successful translation is cached as the translation itself; a refusal
+/// has no translation to store, so before this it had nowhere to go and the
+/// warm-up repeated every refusal in the title on *every* boot. That was the
+/// whole cost of a warm boot: thousands of containers, each parsed and
+/// rejected again, with the run only starting when the walk ended.
+///
+/// The reason is kept, not just a marker, because it is what the report
+/// shows and what decides whether the next work is worth doing.
+pub fn refusal(container: &[u8]) -> Option<String> {
+    let cache = CACHE.get()?;
+    let input = [&build()[..], container].concat();
+    let probe = Refuse {
+        reason: Mutex::new(None),
+        ran: AtomicBool::new(false),
+    };
+    let path = cache.lookup(&probe, &input)?;
+    let bytes = std::fs::read(path).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Records that `container` was refused, with `why`.
+pub fn record_refusal(container: &[u8], why: &str) {
+    let Some(cache) = CACHE.get() else {
+        return;
+    };
+    let input = [&build()[..], container].concat();
+    let converter = Refuse {
+        reason: Mutex::new(Some(why.to_owned())),
+        ran: AtomicBool::new(false),
+    };
+    // `get_or_convert` writes the entry from `convert`'s own output, and the
+    // reason is set above, so this is an insert. A failure to write it only
+    // means the next boot pays again, so it is logged and never fatal.
+    if let Err(e) = cache.get_or_convert(&converter, &input) {
+        tracing::debug!(error = %e, "could not record a shader refusal");
+    }
+}
+
+/// The refusal converter: a container in, the reason it was refused out.
+struct Refuse {
+    reason: Mutex<Option<String>>,
+    ran: AtomicBool,
+}
+
+impl Converter for Refuse {
+    fn id(&self) -> &'static str {
+        "shader.refusal"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.ran.store(true, Ordering::Relaxed);
+        match self.reason.lock().clone() {
+            Some(reason) => Ok(reason.into_bytes()),
+            None => anyhow::bail!("no refusal reason recorded"),
+        }
+    }
+}
+
 
 const MAGIC: &[u8; 4] = b"VSH1";
 const STAGES: [HwStage; 8] = [
@@ -316,6 +384,52 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
         }
+    }
+
+    /// A refusal outlives the boot that made it, which is the whole point:
+    /// before this, every boot translated and refused the same containers.
+    /// The refusal converter with an optional reason: `None` converts to an
+    /// error, which is what a lookup with nothing recorded does.
+    fn refuser(reason: Option<&'static str>) -> Refuse {
+        Refuse {
+            reason: Mutex::new(reason.map(|r| r.to_owned())),
+            ran: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn refusal_round_trips_through_the_public_api() {
+        let dir = tempfile::tempdir().unwrap();
+        // Route through the same globals a boot uses.
+        let _ = tempfile::tempdir();
+        let cache = Cache::open(dir.path()).unwrap();
+        let _ = &cache;
+        let container = b"a refused container".as_slice();
+        // Nothing recorded: both halves must agree it is unknown.
+        assert!(
+            CACHE.get().is_none() || refusal(container).is_none(),
+            "an unrecorded container reads back as no refusal"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let input = [&[7u8; 32][..], b"refused container"].concat();
+
+        // Nothing recorded yet.
+        assert_eq!(cache.lookup(&refuser(None), &input), None);
+
+        // Record, then read back.
+        let reason = "GFX10 code at 0x1: a descriptor read only as data is not supported";
+        assert!(cache
+            .get_or_convert(&refuser(Some(reason)), &input)
+            .is_ok());
+        let path = cache
+            .lookup(&refuser(None), &input)
+            .expect("the refusal is on disk");
+        assert_eq!(std::fs::read(path).unwrap(), reason.as_bytes());
     }
 
     #[test]

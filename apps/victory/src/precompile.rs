@@ -198,17 +198,15 @@ fn translate_one(
         Ok(r) => r,
         Err(e) => return fail(e),
     };
-    // Through the cache the run reads, not `emit::emit` directly: a container
-    // this translates and does not store is one the next boot pays for again.
-    // The cache keys on the container and the build, so a hit here is exactly
-    // the entry `run` will find.
-    let learned = emit::emit(container, p, &program, &structured, &raised, &res);
-    if learned.is_err() {
-        return fail(learned.unwrap_err());
-    }
+    // Through the cache the run reads, once: `host_shader` translates and
+    // stores, so a hit here is exactly the entry `run` will find, and a
+    // refusal is recorded so the next boot does not pay for it again.
     match victory_gpu::shader_cache::host_shader(data) {
         Ok(_) => None,
-        Err(e) => Some(e),
+        Err(e) => {
+            victory_gpu::shader_cache::record_refusal(data, &e);
+            Some(e)
+        }
     }
 }
 
@@ -271,6 +269,17 @@ fn container_outcomes(
         });
         return;
     }
+    // Refused by an earlier boot, for the reason recorded then: nothing to
+    // decode, nothing to emit, and most importantly nothing to pay for.
+    if let Some(why) = victory_gpu::shader_cache::refusal(&bytes) {
+        report.outcomes.push(Outcome {
+            at,
+            hash,
+            stage: "!",
+            reason: Some(why),
+        });
+        return;
+    }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => {
@@ -284,6 +293,10 @@ fn container_outcomes(
             return;
         }
     };
+    // A refusal is cached too: without this every boot re-translates and
+    // re-refuses the same containers, which is what made a "warm" boot as
+    // long as a cold one. The reason is recorded, so the report still shows
+    // it without paying for the translation again.
     for p in programs {
         let stage = stage_name(p.stage);
         let mut reason = translate_one(&bytes, &container, &p);
@@ -294,8 +307,18 @@ fn container_outcomes(
                 reason = Some(format!("validator: {text}"));
             }
         }
-        if reason.is_some() {
+        if let Some(why) = &reason {
             any_failed.store(true, Ordering::Relaxed);
+            // Recorded once per container: the first program that explains
+            // why the container cannot be translated is the reason.
+            victory_gpu::shader_cache::record_refusal(&bytes, why);
+            report.outcomes.push(Outcome {
+                at: at.clone(),
+                hash: hash.clone(),
+                stage,
+                reason,
+            });
+            return;
         }
         report.outcomes.push(Outcome {
             at: at.clone(),
@@ -360,6 +383,50 @@ fn lock<T>(m: &Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
 /// `dir` is `<cache>/shaders` (decision 0003), the folder `run` reads.
 pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> {
     victory_hle::modules::d3d12x::use_shader_cache(dir);
+    // The warm-up runs on its own thread and this returns when it finishes or
+    // when the budget expires, whichever comes first. It used to run inline,
+    // which meant a cold cache over a 128 GB title kept the title from
+    // starting at all: the process sat in a walk, "sleeping", and never
+    // reached the first frame. A boot that starts and caches on first use is
+    // always worth more than a warm-up that finishes.
+    // Default: do not wait at all. The warm-up is background work; the title
+    // starts immediately and the run caches whatever it needs on first use.
+    // `VICTORY_WARM_BUDGET=<seconds>` waits that long (a harness that wants a
+    // warm cache before the title), and `<0>` is impossible to parse, so only
+    // an explicit number ever blocks the boot.
+    let budget = std::env::var("VICTORY_WARM_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if budget == 0 {
+        std::thread::spawn(move || {
+            if let Err(e) = warm_everything(jobs) {
+                tracing::warn!(error = %e, "shader precompiler: warm-up ended early");
+            }
+        });
+        return Ok(());
+    }
+    let (done, finished) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = done.send(warm_everything(jobs));
+    });
+    match finished.recv_timeout(std::time::Duration::from_secs(budget)) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // Still working: leave it running. Everything it stores is
+            // content-addressed and written atomically, so a warm-up cut
+            // short simply leaves the rest to the run.
+            tracing::info!(budget, "shader precompiler: budget reached; the run caches the rest");
+            Ok(())
+        }
+    }
+}
+
+/// Warm every shader under the configured roots, however long that takes.
+pub fn warm_everything(jobs: Option<usize>) -> Result<()> {
+    victory_hle::modules::d3d12x::use_shader_cache(
+        victory_core::Config::load()?.cache_subdir("shaders")?,
+    );
     let cfg = victory_core::Config::load()?;
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(game) = cfg.game_dir.clone() {
@@ -398,6 +465,18 @@ pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> 
     // Unbounded: the producer walks at disk speed and the pool drains it;
     // a bounded queue would make the walk wait on the slowest shader.
     let (queue, incoming) = crossbeam_channel::unbounded::<PathBuf>();
+    // The warm-up must never keep the title from starting. A cold cache over a
+    // 128 GB title is minutes of work, and a booting title is always worth
+    // more than a finished warm-up. `VICTORY_WARM_BUDGET` (seconds) bounds it;
+    // `0` warms as long as it takes. Past the budget the rest is left to the
+    // run, which caches on first use anyway.
+    let budget = std::env::var("VICTORY_WARM_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    let deadline = (budget > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_secs(budget));
+    let timed_out = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
             let roots: Vec<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
@@ -409,6 +488,14 @@ pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> 
                 |_, _| true,
             );
             for (_, event) in walked {
+                // The walk is what `thread::scope` actually waits for, so the
+                // deadline has to be here too: without it the pool empties and
+                // the scope still sits in the walk over a 128 GB tree, which is
+                // the "sleeping" process that never reaches the title.
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    timed_out.store(true, Ordering::Relaxed);
+                    break;
+                }
                 let dua_core::RootEvent::Entry(Ok(entry)) = event else {
                     continue;
                 };
@@ -429,6 +516,12 @@ pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> 
                 loop {
                     let next = incoming.recv();
                     let Ok(path) = next else { break };
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        // Past the budget: take the path and drop it, so the
+                        // pool empties and this scope can end.
+                        timed_out.store(true, Ordering::Relaxed);
+                        continue;
+                    }
                     // Map, do not read: `fs::read` copies a whole file
                     // into a fresh heap Vec, which for a 2 GB archive is
                     // the single largest cost of a warm-up. The scan is
@@ -459,6 +552,16 @@ pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> 
                         // `counts` tells a cache hit from a translation.
                         let before = victory_gpu::shader_cache::counts().0;
                         let one = std::time::Instant::now();
+                        // Refused on an earlier boot: the reason is on disk,
+                        // so this costs a hash lookup instead of a
+                        // translation. Without this every boot re-translated
+                        // and re-refused the same containers, which is what
+                        // made a warm boot as slow as a cold one.
+                        if let Some(why) = victory_gpu::shader_cache::refusal(container) {
+                            counts[0].fetch_add(1, Ordering::Relaxed);
+                            lock(&failed).push((why, path.clone()));
+                            return (false, true);
+                        }
                         let done = victory_gpu::shader_cache::host_shader(container);
                         let after = victory_gpu::shader_cache::counts().0;
                         let failed_here = match &done {
@@ -470,6 +573,8 @@ pub fn warm_on_boot(dir: std::path::PathBuf, jobs: Option<usize>) -> Result<()> 
                             Err(e) => {
                                 counts[0].fetch_add(1, Ordering::Relaxed);
                                 lock(&failed).push((e.clone(), path.clone()));
+                                // Remembered, so the next boot skips it.
+                                victory_gpu::shader_cache::record_refusal(container, &e);
                                 tracing::warn!(
                                     path = %path.display(),
                                     hash = %&hash.to_hex()[..16],
@@ -590,6 +695,18 @@ pub fn run(
     // Unbounded: the producer walks at disk speed and the pool drains it;
     // a bounded queue would make the walk wait on the slowest shader.
     let (queue, incoming) = crossbeam_channel::unbounded::<PathBuf>();
+    // The warm-up must never keep the title from starting. A cold cache over a
+    // 128 GB title is minutes of work, and a booting title is always worth
+    // more than a finished warm-up. `VICTORY_WARM_BUDGET` (seconds) bounds it;
+    // `0` warms as long as it takes. Past the budget the rest is left to the
+    // run, which caches on first use anyway.
+    let budget = std::env::var("VICTORY_WARM_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    let deadline = (budget > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_secs(budget));
+    let timed_out = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
             let roots: Vec<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
@@ -630,6 +747,12 @@ pub fn run(
                     // A worker that finds nothing yet waits on the producer.
                     let next = incoming.recv();
                     let Ok(path) = next else { break };
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        // Past the budget: take the path and drop it, so the
+                        // pool empties and this scope can end.
+                        timed_out.store(true, Ordering::Relaxed);
+                        continue;
+                    }
                     let Ok(file) = std::fs::File::open(&path) else {
                         tracing::warn!(path = %path.display(), "walk: cannot open");
                         continue;

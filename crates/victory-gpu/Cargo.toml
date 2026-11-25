@@ -19,6 +19,7 @@ victory-vulkan.workspace = true
 sdl3-sys = { version = "0.7.3", default-features = false, features = ["no-link", "use-ash-v0-38"] }
 crc32fast.workspace = true
 bytemuck.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1000,6 +1000,7 @@ dependencies = [
  "crc32fast",
  "libc",
  "miniz_oxide",
+ "parking_lot",
  "sdl3-sys",
  "tempfile",
  "tracing",

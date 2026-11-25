@@ -152,11 +152,37 @@ pub fn run(
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
-        .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    println!("title exited with {code}");
-    Ok(())
+    // A title whose main thread never returns must not hang the process: the
+    // exception path below reports the fault and then waits for a thread
+    // that is parked in the guest, which is what made every failed boot
+    // something to `kill` by hand. `VICTORY_EXIT_TIMEOUT` (seconds) bounds
+    // the wait; the default is generous because a working title legitimately
+    // runs for hours.
+    let limit = std::env::var("VICTORY_EXIT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+    let (done, exited) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(main.join());
+    });
+    match exited.recv_timeout(std::time::Duration::from_secs(limit)) {
+        Ok(joined) => {
+            let code = joined.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+            println!("title exited with {code}");
+            Ok(())
+        }
+        Err(_) => {
+            // The title is still parked. Report and leave, rather than
+            // waiting on a thread that will never come back; `_exit` skips
+            // the destructors a wedged title would deadlock in.
+            eprintln!(
+                "VIctory: the title did not exit within {limit}s; exiting (VICTORY_EXIT_TIMEOUT)"
+            );
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+            std::process::exit(2)
+        }
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
