@@ -91,6 +91,34 @@ impl Builder {
         self.module.id()
     }
 
+    /// The result type `id` was made with, if it had one.
+    pub fn type_of(&self, id: Id) -> Option<Id> {
+        self.module.type_of(id)
+    }
+
+    /// The function body's length in words: an insertion point for the
+    /// instructions that must come before everything else in it.
+    pub fn function_len(&self) -> usize {
+        self.module.function_len()
+    }
+
+    /// `OpVariable` in `space` of `pointer_type`, as words, for insertion at
+    /// an earlier point of the body.
+    pub fn variable_words(&self, pointer_type: Id, id: Id, space: StorageClass) -> Vec<u32> {
+        vec![
+            4 << 16 | Op::Variable as u32,
+            pointer_type.0,
+            id.0,
+            space as u32,
+        ]
+    }
+
+    /// Inserts the words a previous [`Builder::function_len`] position
+    /// precedes.
+    pub fn insert_function_words(&mut self, at: usize, words: &[u32]) {
+        self.module.insert_function_words(at, words);
+    }
+
     /// The module as a file, header and all.
     pub fn finish(self) -> Vec<u8> {
         self.module.finish()

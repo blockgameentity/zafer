@@ -17,6 +17,8 @@ use victory_shader::io::{Interp, Io, Target};
 use victory_shader::native::HwStage;
 use victory_spirv::enums::BuiltIn;
 
+use victory_spirv::module::Id;
+
 use crate::module::{Module, Stage, Variable};
 
 /// One interface row: where it comes from, where it goes and what it is.
@@ -50,6 +52,8 @@ pub struct Interface {
     pixel_inputs: HashMap<(u8, u8), Row>,
     /// Outputs by export target.
     outputs: HashMap<Key, Row>,
+    /// `gl_SubgroupInvocationID`: the console's lane index.
+    pub subgroup_lane_id: Option<Row>,
     /// `gl_Position`.
     pub position: Option<Row>,
     /// `gl_FragCoord`.
@@ -63,12 +67,49 @@ pub struct Interface {
 }
 
 impl Interface {
+    /// `gl_SubgroupInvocationID`, made on first use: every console wave is
+    /// one Vulkan subgroup.
+    pub fn subgroup_lane(&mut self) -> Option<Id> {
+        self.subgroup_lane_id.map(|row| row.variable.id)
+    }
+}
+
+impl Interface {
     /// Declares the interface of `io` for `stage` in `module`.
     ///
     /// The numbering is the signature's order, so a pipeline built from the
     /// same signature matches without a second description of it.
     pub fn build(module: &mut Module, stage: Stage, io: &Io) -> Interface {
         let mut this = Interface::default();
+        // Every console wave is one Vulkan subgroup, so a shader that needs
+        // its lane index reads the built-in.
+        let lane = module.builtin(BuiltIn::SubgroupLocalInvocationId, module.u32_ty);
+        this.subgroup_lane_id = Some(Row {
+            location: None,
+            builtin: Some(BuiltIn::SubgroupLocalInvocationId),
+            variable: lane,
+            components: 1,
+        });
+        // Every console wave is one Vulkan subgroup, so a shader that needs
+        // its lane index reads the built-in.
+        let lane = module.builtin(BuiltIn::SubgroupLocalInvocationId, module.u32_ty);
+        this.subgroup_lane_id = Some(Row {
+            location: None,
+            builtin: Some(BuiltIn::SubgroupLocalInvocationId),
+            variable: lane,
+            components: 1,
+        });
+        // Every console wave is one Vulkan subgroup, so a shader that needs
+        // its lane index reads the built-in once and every lane has its own.
+        let u32v = module.vec(module.u32_ty, 3);
+        let _ = u32v;
+        let lane = module.builtin(BuiltIn::SubgroupLocalInvocationId, module.u32_ty);
+        this.subgroup_lane_id = Some(Row {
+            location: None,
+            builtin: Some(BuiltIn::SubgroupLocalInvocationId),
+            variable: lane,
+            components: 1,
+        });
         if stage == Stage::Pixel {
             this.declare_fragment_inputs(module, io);
         }

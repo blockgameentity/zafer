@@ -127,6 +127,15 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Skip the launch-time shader pre-compile.
+        ///
+        /// The warm-up translates every cached shader before the title starts,
+        /// which is right for a real boot and wrong while iterating on the
+        /// emitter: it is the slowest part of a start. Shaders are still
+        /// translated on demand as the title asks for them, so this only
+        /// moves the work, it does not change the result.
+        #[arg(long, alias = "no-shaders")]
+        skip_shaders: bool,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -195,8 +204,9 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            skip_shaders,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(&exe, unimplemented, strict, execute, console, skip_shaders),
         Command::Config => show_config(),
     }
 }

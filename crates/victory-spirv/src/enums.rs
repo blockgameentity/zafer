@@ -110,6 +110,10 @@ pub enum StorageClass {
     AtomicCounter = 10,
     Image = 11,
     StorageBuffer = 12,
+    /// A pointer into a buffer device address (Vulkan's
+    /// `VK_EXT_buffer_device_address`): the console's heap, whose addresses
+    /// the title computes and hands the shader as plain integers.
+    PhysicalStorageBuffer = 5349,
 }
 
 /// An image's shape.

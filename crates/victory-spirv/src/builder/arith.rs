@@ -129,6 +129,15 @@ impl Builder {
         id
     }
 
+    /// `OpUMulExtended`: the 64-bit unsigned product as a struct of its two
+    /// 32-bit halves.
+    pub fn umul_extended(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.module.id();
+        self.module
+            .op(Op::UMulExtended, Some(ty), Some(id), &[a.0, b.0]);
+        id
+    }
+
     /// `OpCompositeConstruct`.
     pub fn composite_construct(&mut self, ty: Id, parts: &[Id]) -> Id {
         let operands: Vec<u32> = parts.iter().map(|p| p.0).collect();
@@ -189,6 +198,42 @@ impl Builder {
             Some(id),
             &[vector.0, component.0, index.0],
         );
+        id
+    }
+
+    /// `OpFma`: `a * b + c`, fused to one rounding.
+    pub fn fma(&mut self, ty: Id, a: Id, b: Id, c: Id) -> Id {
+        let id = self.module.id();
+        self.module
+            .op(Op::Fma, Some(ty), Some(id), &[a.0, b.0, c.0]);
+        id
+    }
+
+    /// `OpGroupNonUniformBroadcastFirst`: one lane's value, every lane.
+    pub fn group_broadcast_first(&mut self, ty: Id, group: Id, value: Id) -> Id {
+        let id = self.module.id();
+        self.module.op(
+            Op::GroupNonUniformBroadcastFirst,
+            Some(ty),
+            Some(id),
+            &[group.0, value.0],
+        );
+        id
+    }
+
+    /// `OpConvertUToPtr`: an address as a physical pointer.
+    pub fn convert_u_to_ptr(&mut self, ty: Id, value: Id) -> Id {
+        let id = self.module.id();
+        self.module
+            .op(Op::ConvertUToPtr, Some(ty), Some(id), &[value.0]);
+        id
+    }
+
+    /// `OpConvertPtrToU`: a physical pointer back as an address.
+    pub fn convert_ptr_to_u(&mut self, ty: Id, value: Id) -> Id {
+        let id = self.module.id();
+        self.module
+            .op(Op::ConvertPtrToU, Some(ty), Some(id), &[value.0]);
         id
     }
 

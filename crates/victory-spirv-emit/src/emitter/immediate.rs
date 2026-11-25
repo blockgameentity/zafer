@@ -27,12 +27,41 @@ impl<'a> Emitter<'a> {
             // rasteriser allocates, so nothing is asked for.
             "s_sendmsg" if imm & 0xF == GS_ALLOC_REQ => Ok(()),
             "s_endpgm" => {
-                b.return_void();
-                // The block's exit must not add a second `OpReturn`.
+                // In the state machine a block may not return: the return
+                // would leave the loop and the switch through an edge that
+                // is not their merge ("block exits the loop, but not via a
+                // structured exit"). The lane records that it is finished
+                // and goes back to the dispatcher, whose default case is
+                // what leaves the loop.
+                if let Some(machine) = self.machine {
+                    let done = b.constant_i32(-1);
+                    b.store(machine.pc, done);
+                    let next = b.at(machine.continue_at);
+                    b.branch(next);
+                } else {
+                    b.return_void();
+                }
+                // The block's exit must not add a second terminator.
                 self.returned = true;
                 Ok(())
             }
+            // A branch is the block's terminator, which [`super::flow`]
+            // writes from the IR's exit; the instruction itself carries no
+            // value and must not be emitted twice.
+            name if name.starts_with("s_cbranch_") => Ok(()),
+            // `s_branch` likewise, and `s_setpc_b64` the same for an
+            // indirect handover.
+            "s_branch" | "s_setpc_b64" => Ok(()),
             "s_icache_inv" | "s_dcache_inv" | "s_dcache_inv_vol" => Ok(()),
+            // A trap is a shader that decided it cannot continue. SPIR-V has
+            // no trap that a driver must honour in every case, so the lane
+            // ends: `OpReturn` is what the console's `s_trap` amounts to once
+            // the program has already misbehaved.
+            "s_trap" => {
+                b.return_void();
+                self.returned = true;
+                Ok(())
+            }
             _ => Err(super::unsupported(inst)),
         }
     }

@@ -68,11 +68,17 @@ pub fn validate(spirv: &[u8]) -> Validity {
                 text = String::from_utf8_lossy(&out.stdout).into_owned();
             }
             if let Some(dir) = std::env::var_os("VICTORY_SPIRV_DUMP") {
-                let at = format!(
-                    "{}/invalid.spv",
-                    std::path::Path::new(&dir).display()
-                );
-                let _ = std::fs::write(at, spirv);
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                let at = format!("{}/invalid-{n:05}.spv", std::path::Path::new(&dir).display());
+                let _ = std::fs::write(&at, spirv);
+                if n < 400 {
+                    let _ = std::fs::write(
+                        format!("{}/invalid-{n:05}.txt", std::path::Path::new(&dir).display()),
+                        format!("{text}"),
+                    );
+                }
             }
             Validity::Invalid(text.trim().to_owned())
         }

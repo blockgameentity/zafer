@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    skip_shaders: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -35,7 +36,7 @@ pub fn run(
     // Before the title starts: every shader it has not needed yet is
     // translated now, so a shader bug shows up in the first seconds of a
     // boot rather than at the third minute of a world load.
-    if std::env::var_os("VICTORY_NO_WARM").is_none() {
+    if !skip_shaders && std::env::var_os("VICTORY_NO_WARM").is_none() {
         let shaders = cfg.cache_subdir("shaders")?;
         if let Err(e) = crate::precompile::warm_on_boot(shaders, None) {
             eprintln!("VIctory: shader warm-up skipped: {e}");

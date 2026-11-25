@@ -81,7 +81,19 @@ impl Module {
     pub fn new(stage: Stage) -> Module {
         let mut builder = Builder::new();
         builder.capability(Capability::Shader);
-        builder.memory_model(AddressingModel::Logical, MemoryModel::Glsl450);
+        // The console's addresses are integers the title computes, and a
+        // shader dereferences them: that is a buffer device address, which
+        // SPIR-V spells with the physical storage buffer capability and the
+        // physical addressing model. `docs/vulkan-backend.md` picks it
+        // because it needs no descriptor set per resource; the host only
+        // has to enable `VK_EXT_buffer_device_address`.
+        builder.capability(Capability::PhysicalStorageBufferAddresses);
+        // The addressing model is the physical one; the memory model stays
+        // GLSL 450's, because `VulkanMemoryModel` needs SPIR-V 1.5 and
+        // Vulkan 1.2 ("not allowed by Vulkan 1.1"). Physical addressing does
+        // not require it.
+        builder.extension("SPV_EXT_physical_storage_buffer");
+        builder.memory_model(AddressingModel::PhysicalStorageBuffer64, MemoryModel::Glsl450);
         // The extended instruction set a translated shader needs for what
         // SPIR-V core has no opcode for: `min`/`max`/`clamp` on integers,
         // `floor`/`ceil`/`round`/`trunc`/`fract`, `sin`/`cos`/`exp`/`log`/
@@ -214,6 +226,32 @@ impl Module {
         }
         self.interface.push(id);
         Variable { id, ty, space }
+    }
+
+    /// The parameter block: a storage buffer of dwords, one per root
+    /// parameter.
+    ///
+    /// A root parameter's value on the console *is* the address of what it
+    /// describes, so the block carries those addresses and the shader turns
+    /// each into a physical pointer. It is a storage buffer rather than a
+    /// push constant because Vulkan only guarantees 128 bytes of push
+    /// constant, and the title's layouts are larger; a runtime array has no
+    /// such limit and the host binds it once per pipeline.
+    pub fn parameters(&mut self, count: u32) -> Variable {
+        let array = self.builder.runtime_array(self.u32_ty);
+        self.builder
+            .decorate(array, Decoration::ArrayStride, &[4]);
+        let block = self.builder.struct_of(&[array]);
+        self.builder.decorate(block, Decoration::Block, &[]);
+        self.builder.decorate_offset(block, 0, 0);
+        let id = self.builder.variable(block, StorageClass::StorageBuffer, None);
+        self.builder.decorate(id, Decoration::DescriptorSet, &[0]);
+        self.builder.decorate(id, Decoration::Binding, &[0]);
+        Variable {
+            id,
+            ty: block,
+            space: StorageClass::StorageBuffer,
+        }
     }
 
     /// A module-scope variable of `ty` in `space` (a register file, a user

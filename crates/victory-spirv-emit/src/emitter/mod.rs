@@ -20,14 +20,21 @@
 //! shader either translates or says which instruction stopped it, so a gap
 //! can never render wrongly in silence.
 
+mod body;
 mod export;
 mod flow;
 mod immediate;
+mod interp;
 mod lanes;
+mod machine;
 mod memory;
 mod scalar;
+mod registers;
+pub(crate) mod structure;
 mod trans;
 mod vector;
+
+pub(crate) use body::{has_effect, operands, static_name, unsupported};
 
 #[cfg(test)]
 mod tests;
@@ -58,6 +65,12 @@ pub(crate) struct Types {
     pub u32_: Id,
     pub f32_: Id,
     pub bool_: Id,
+    /// `struct { u32, u32 }`, the result of the extended multiplies.
+    pub u32_pair: Id,
+    /// `vecN<f32>`, for an output built from several channels.
+    pub f32_2: Id,
+    pub f32_3: Id,
+    pub f32_4: Id,
 }
 
 /// A shader's translation in progress.
@@ -90,6 +103,31 @@ pub(crate) struct Emitter<'a> {
     /// Whether the instruction just written terminated the function
     /// (`s_endpgm`): the block's own exit must not be written then.
     returned: bool,
+    /// Where in the function body a variable made after the first block
+    /// belongs: right after the ones the entry block declared.
+    decls_at: Option<usize>,
+    /// The merges every terminator needs, and the order to write blocks in.
+    merges: Vec<structure::Merge>,
+    loops: HashMap<usize, usize>,
+    order: Vec<usize>,
+    /// Headers whose merge is a block of their own, by header.
+    trampolines: HashMap<usize, usize>,
+    /// The label of each such block, by header.
+    trampoline_labels: HashMap<usize, Id>,
+    /// The per-lane state machine, when the program's CFG is not something
+    /// SPIR-V can nest.
+    machine: Option<machine::Machine>,
+    /// Whether to emit the state machine rather than nested control flow.
+    pub(crate) use_machine: bool,
+    /// The instruction being emitted, as the tracer named it: a memory
+    /// access's address is looked up by this.
+    pub(crate) site: victory_shader::resource::Site,
+    /// The block holding the root parameters' addresses.
+    pub(crate) parameters: Option<Id>,
+    /// The workgroup's shared memory, made when an LDS access needs it.
+    pub(crate) shared: Option<Id>,
+    /// The lane's index within its wave, loaded once.
+    pub(crate) subgroup_lane: Option<Id>,
 }
 
 impl<'a> Emitter<'a> {
@@ -137,6 +175,10 @@ impl<'a> Emitter<'a> {
                 u32_: Id(0),
                 f32_: Id(0),
                 bool_: Id(0),
+                u32_pair: Id(0),
+                f32_2: Id(0),
+                f32_3: Id(0),
+                f32_4: Id(0),
             },
             vars: HashMap::new(),
             regs,
@@ -151,6 +193,18 @@ impl<'a> Emitter<'a> {
             glsl_set: Id(0),
             gap: None,
             returned: false,
+            decls_at: None,
+            merges: Vec::new(),
+            loops: HashMap::new(),
+            order: Vec::new(),
+            trampolines: HashMap::new(),
+            trampoline_labels: HashMap::new(),
+            machine: None,
+            use_machine: false,
+            site: (0, 0),
+            parameters: None,
+            shared: None,
+            subgroup_lane: None,
         }
     }
 
@@ -172,8 +226,22 @@ impl<'a> Emitter<'a> {
             u32_: module.u32_ty,
             f32_: module.f32_ty,
             bool_: module.bool_ty,
+            // `OpUMulExtended`'s result is a struct of the two halves.
+            u32_pair: b.struct_of(&[module.u32_ty, module.u32_ty]),
+            f32_2: module.vec(module.f32_ty, 2),
+            f32_3: module.vec(module.f32_ty, 3),
+            f32_4: module.vec(module.f32_ty, 4),
         };
         self.interface = Interface::build(&mut module, stage, self.io);
+        // One block dword per root parameter: the value *is* the address of
+        // what the parameter describes, which is what makes a console
+        // shader's root signature one host descriptor.
+        let slots = self.program.layout.len();
+        if let Ok(slots) = u32::try_from(slots) {
+            if slots > 0 {
+                self.parameters = Some(module.parameters(slots).id);
+            }
+        }
         self.glsl_set = module.glsl();
         self.block = function.entry.label;
         self.function_variables(b);
@@ -188,22 +256,69 @@ impl<'a> Emitter<'a> {
         // The first block is the entry block `Builder::function` already
         // labelled, so it reuses that label: reserving one for it too left
         // an empty, unterminated block right after `OpFunction`.
+        // A function's first block may not be a branch target ("first block
+        // of function is targeted by block <n>"), and the console's entry
+        // block is one whenever the program loops back to its start. So the
+        // first block only branches to block 0's own label, which every
+        // edge can then target.
         self.labels = (0..self.ir.blocks.len())
-            .map(|i| {
-                if i == 0 {
-                    function.entry.label
-                } else {
-                    b.reserve_label().label
-                }
-            })
+            .map(|_| b.reserve_label().label)
             .collect();
-        for i in 0..self.ir.blocks.len() {
+        // Later `OpVariable`s go here: after the ones just declared, before
+        // the branch out of the entry block.
+        self.decls_at = Some(b.function_len());
+        if self.use_machine {
+            // The machine's head: the entry block branches into the loop and
+            // the shader's blocks are dispatched from it.
+            let machine = self.machine_head(b);
+            self.machine = Some(machine);
+        } else {
+            let first = b.at(self.labels[0]);
+            b.branch(first);
+        }
+        // The merges and the order the blocks are written in: SPIR-V needs a
+        // dominance-respecting order and a merge instruction per conditional
+        // branch and back edge, neither of which the console's CFG states.
+        let cfg = structure::Structured::of(&self.ir.blocks);
+        self.merges = cfg.merges;
+        self.loops = cfg.loops;
+        self.order = cfg.order;
+        // Each header that needs a merge block of its own gets one, reserved
+        // here so a branch anywhere can name it.
+        for (header, join) in &cfg.trampolines {
+            self.trampolines.insert(*header, *join);
+            let label = b.reserve_label().label;
+            self.trampoline_labels.insert(*header, label);
+        }
+        // The entry block always comes first (it is the label `OpFunction`
+        // wrote), so the order starts there and every other block follows
+        // in reverse postorder.
+        let order = self.order.clone();
+        for i in order {
             let label = self.labels[i];
-            if i > 0 {
-                b.label(label);
-            }
+            b.label(label);
             self.returned = false;
+            // A condition's SPIR-V value belongs to the block that computed
+            // it: reusing the memoised id in another block is a use its
+            // definition does not dominate ("ID defined in block N does not
+            // dominate its use in block M"). The atoms themselves are loads
+            // of registers, which every block can do for itself.
+            self.diagrams.clear();
             self.block_body(b, i);
+        }
+        // A merge block of its own: empty but for a branch to the join, so
+        // the join is one header's merge only.
+        let mut pairs: Vec<(usize, usize)> = self.trampolines.iter().map(|(h, j)| (*h, *j)).collect();
+        pairs.sort_unstable();
+        for (header, join) in pairs {
+            let label = self.trampoline_labels[&header];
+            b.label(label);
+            let target = b.at(self.labels[join]);
+            b.branch(target);
+        }
+        // The strided state machine's tail closes the loop and returns.
+        if let Some(machine) = self.machine {
+            self.machine_tail(b, machine);
         }
         // The last block's terminator is already written; a return after it
         // is unreachable but keeps a module valid when a block's exit was a
@@ -227,251 +342,27 @@ impl<'a> Emitter<'a> {
     }
 
     /// A function-scope variable, declared in the entry block.
+    ///
+    /// SPIR-V requires every `OpVariable` of a function to be among the
+    /// first instructions of its first block. The registers known when the
+    /// function starts are declared there as the body begins; a register
+    /// first named by `var_of` later (an operand the IR did not list among
+    /// the block's reads) is inserted at the same point rather than
+    /// appended where it was asked for, which is what `spirv-val` reports
+    /// as "all OpVariable instructions in a function must be the first
+    /// instructions in the first block".
     fn new_variable(&mut self, b: &mut Builder, ty: Id) -> Id {
         let ptr = b.pointer(StorageClass::Function, ty);
         let id = b.id();
-        b.declare_variable(self.block, ptr, id);
+        match self.decls_at {
+            Some(at) => {
+                let words = b.variable_words(ptr, id, StorageClass::Function);
+                b.insert_function_words(at, &words);
+            }
+            None => {
+                b.declare_variable(self.block, ptr, id);
+            }
+        }
         id
     }
-
-    /// The function variable of `reg`, made on first use.
-    pub(crate) fn var_of(&mut self, b: &mut Builder, reg: Reg) -> Id {
-        if let Some(&id) = self.vars.get(&reg) {
-            return id;
-        }
-        let ty = match reg {
-            Reg::Scc => self.types.bool_,
-            _ => self.types.i32_,
-        };
-        let id = self.new_variable(b, ty);
-        self.vars.insert(reg, id);
-        id
-    }
-
-    /// The register a value lives in.
-    pub(crate) fn reg_of(&self, value: Value) -> Option<Reg> {
-        self.regs.get(&value).copied()
-    }
-
-    /// The `i32` a value holds.
-    pub(crate) fn load_i32(&mut self, b: &mut Builder, value: Value) -> Option<Id> {
-        let reg = self.reg_of(value)?;
-        let var = self.var_of(b, reg);
-        if reg == Reg::Scc {
-            let bit = b.load(self.types.bool_, var);
-            let one = b.constant_i32(1);
-            let zero = b.constant_i32(0);
-            return Some(b.select(self.types.i32_, bit, one, zero));
-        }
-        Some(b.load(self.types.i32_, var))
-    }
-
-    /// The `f32` a value holds, from its dword's bit pattern.
-    pub(crate) fn load_f32(&mut self, b: &mut Builder, value: Value) -> Option<Id> {
-        let bits = self.load_i32(b, value)?;
-        Some(b.bitcast(self.types.f32_, bits))
-    }
-
-    /// The `bool` a value holds (SCC, or a dword's nonzero-ness).
-    pub(crate) fn load_bit(&mut self, b: &mut Builder, value: Value) -> Option<Id> {
-        let reg = self.reg_of(value)?;
-        let var = self.var_of(b, reg);
-        if reg == Reg::Scc {
-            return Some(b.load(self.types.bool_, var));
-        }
-        let bits = b.load(self.types.i32_, var);
-        let zero = b.constant_i32(0);
-        Some(b.inotequal(self.types.bool_, bits, zero))
-    }
-
-    /// Writes a dword into a register.
-    ///
-    /// A register variable holds `i32` (or `bool` for SCC), so a value of
-    /// any other type is bitcast before the store: Vulkan requires the
-    /// stored object's type to match the pointer's, and a float result
-    /// reaching a dword variable is what `spirv-val` reports as "pointer's
-    /// type does not match object's type". Bitcasting here rather than at
-    /// each arm means no future arm can forget it, and a store to a bool
-    /// variable still goes through [`Self::store_bit`].
-    pub(crate) fn store_i32(&mut self, b: &mut Builder, reg: Reg, value: Id) {
-        let var = self.var_of(b, reg);
-        if reg == Reg::Scc {
-            let zero = b.constant_i32(0);
-            let bit = b.inotequal(self.types.bool_, value, zero);
-            b.store(var, bit);
-            return;
-        }
-        b.store(var, value);
-    }
-
-    /// Writes a `bool` into a register.
-    pub(crate) fn store_bit(&mut self, b: &mut Builder, reg: Reg, value: Id) {
-        let var = self.var_of(b, reg);
-        if reg == Reg::Scc {
-            b.store(var, value);
-            return;
-        }
-        let one = b.constant_i32(1);
-        let zero = b.constant_i32(0);
-        let bits = b.select(self.types.i32_, value, one, zero);
-        b.store(var, bits);
-    }
-
-    /// One block: its phis, its instructions, its exit.
-    ///
-    /// A phi is a store on every edge into the block, which is what a
-    /// register join is; the edge's store is written where the edge is
-    /// taken, so every predecessor may run it and only its own lanes see
-    /// the value. The IR's phis are per register dword, so two phis of one
-    /// block store to two registers and never interfere.
-    fn block_body(&mut self, b: &mut Builder, i: usize) {
-        let block = self.ir.blocks[i].clone();
-        // The phis: one store per edge from each predecessor.
-        for phi in &block.phis {
-            let args: Vec<(usize, Value)> = block
-                .preds
-                .iter()
-                .copied()
-                .zip(phi.args.iter().copied())
-                .collect();
-            let reg = phi.reg;
-            for (pred, arg) in args {
-                let value = match self.load_i32(b, arg) {
-                    Some(id) => id,
-                    None => continue,
-                };
-                let _ = pred;
-                // Every edge is in the same block position here, because a
-                // phi's incoming values are already stored in their own
-                // registers by the predecessor: this stores the register's
-                // content, which the predecessor wrote.
-                self.store_i32(b, reg, value);
-            }
-        }
-        // Whether the block's terminator has been written: `s_endpgm` is a
-        // return, and the block's exit may be another.
-        let mut terminated = false;
-        let insts = block.insts.clone();
-        for inst in &insts {
-            // A block is over once it has been terminated. `s_endpgm` is a
-            // return, and the block's own exit is another: writing both put
-            // two `OpReturn`s in one block, which `spirv-val` rejects ("a
-            // return must appear in a block"). Instructions after a return
-            // are unreachable by construction, so dropping them loses
-            // nothing.
-            if terminated {
-                break;
-            }
-            self.instruction(b, inst);
-            terminated = self.returned;
-        }
-        // A block that cannot be terminated has no SPIR-V form, and a block
-        // without a terminator is invalid whatever follows: both are gaps
-        // the whole module must report, so neither may be dropped here.
-        // (`spirv-val` found this: "a block must end with a branch
-        // instruction" was the commonest refusal in the title.)
-        // `s_endpgm` already terminated this block: a second
-        // `OpReturn` in one block is what `spirv-val` reports as "a return
-        // must appear in a block".
-        if terminated {
-            return;
-        }
-        if let Err(e) = self.exit(b, i) {
-            if self.gap.is_none() {
-                self.gap = Some(e);
-            }
-            // Terminate anyway, so the rest of the module stays well formed
-            // enough for the validator to report the real problem.
-            b.return_void();
-        }
-    }
-
-    /// One instruction, dispatched by its encoding.
-    ///
-    /// An instruction the emitter does not name is recorded as a gap: the
-    /// shader's translation reports it with its offset, so a missing arm is
-    /// an error and never a silently dropped operation.
-    fn instruction(&mut self, b: &mut Builder, inst: &Inst) {
-        let result = match &inst.fields {
-            // The transcendental and three-input families have no core
-            // opcode, so they are dispatched before the arithmetic arms.
-            Fields::Valu(_) if self.is_trans(inst.name()) => self.trans(b, inst),
-            Fields::Valu(_) => self.vector(b, inst),
-            Fields::Sop { .. } => self.scalar(b, inst),
-            Fields::Exp { .. } => self.export(b, inst),
-            Fields::Sopp { imm } => self.immediate(b, inst, *imm),
-            Fields::Smem { .. }
-            | Fields::Buffer { .. }
-            | Fields::Image { .. }
-            | Fields::Flat { .. }
-            | Fields::Ds { .. } => self.memory(b, inst),
-            Fields::Vintrp { .. } => Err(unsupported(inst)),
-        };
-        // Two nested `if`s rather than a let-chain: `self.gap.is_none()`
-        // borrows immutably while the body assigns through it.
-        #[allow(clippy::collapsible_if)]
-        if let Err(error) = result {
-            if self.gap.is_none() {
-                self.gap = Some(error);
-            }
-        }
-    }
-}
-
-/// Whether an instruction has an effect, so a value it cannot express must
-/// fail the shader rather than silently do nothing.
-pub(crate) fn has_effect(inst: &Inst) -> bool {
-    matches!(
-        inst.fields,
-        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. } | Fields::Ds { .. }
-    )
-}
-
-/// The values an instruction names, in encoded order.
-pub(crate) fn operands(fields: &Fields) -> Vec<Operand> {
-    match fields {
-        Fields::Sop { dst, src, .. } => dst.iter().chain(src.iter()).copied().collect(),
-        Fields::Valu(v) => v.dst.iter().chain(v.src.iter()).copied().collect(),
-        Fields::Vintrp { dst, src, attr } => vec![*dst, *src, *attr],
-        Fields::Ds { dst, addr, data, .. } => dst
-            .iter()
-            .chain(addr.iter())
-            .chain(data.iter())
-            .copied()
-            .collect(),
-        Fields::Buffer { addr, rsrc, .. } => vec![*addr, *rsrc],
-        Fields::Image { rsrc, .. } => vec![*rsrc],
-        Fields::Flat { dst, addr, .. } => dst.iter().chain(addr.iter()).copied().collect(),
-        Fields::Sopp { .. } | Fields::Exp { .. } => Vec::new(),
-        Fields::Smem { base, soffset, .. } => vec![*base, *soffset],
-    }
-}
-
-/// One instruction the emitter does not translate.
-pub(crate) fn unsupported(inst: &Inst) -> Error {
-    let what = match inst.name() {
-        "" => "an instruction with no name",
-        name => name,
-    };
-    Error::Unsupported {
-        offset: inst.machine.offset,
-        what: static_name(what),
-    }
-}
-
-/// A name for an error that outlives the borrow it came from.
-pub(crate) fn static_name(name: &str) -> &'static str {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut set = NAMES
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = set.get(name) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    set.insert(leaked);
-    leaked
 }

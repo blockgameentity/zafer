@@ -19,6 +19,10 @@ pub struct Module {
     sections: [Vec<u32>; Section::COUNT],
     /// One past the largest id handed out.
     bound: u32,
+    /// The result type of each id handed out, by `id.0`. An emitter that
+    /// stores a value in a typed variable has to know the type it computed,
+    /// and the type is a property of the instruction that produced the id.
+    result_types: Vec<Option<Id>>,
 }
 
 impl Default for Module {
@@ -28,6 +32,7 @@ impl Default for Module {
         Module {
             sections: Default::default(),
             bound: 1,
+            result_types: Vec::new(),
         }
     }
 }
@@ -109,6 +114,7 @@ impl Module {
         Module {
             sections: Default::default(),
             bound: 1,
+            result_types: Vec::new(),
         }
     }
 
@@ -116,7 +122,44 @@ impl Module {
     pub fn id(&mut self) -> Id {
         let id = Id(self.bound);
         self.bound += 1;
+        self.result_types.push(None);
         id
+    }
+
+    /// The instruction words written into the function body so far, as an
+    /// insertion point for instructions that must come first (the
+    /// function-scope `OpVariable`s of a function whose registers are only
+    /// known as its body is translated).
+    pub fn function_len(&self) -> usize {
+        self.sections[Section::Function as usize].len()
+    }
+
+    /// Inserts `words` into the function body at `at`, which a previous
+    /// [`Module::function_len`] returned.
+    pub fn insert_function_words(&mut self, at: usize, words: &[u32]) {
+        let section = &mut self.sections[Section::Function as usize];
+        let at = at.min(section.len());
+        section.splice(at..at, words.iter().copied());
+    }
+
+    /// The result type of `id`, when the instruction made it had one.
+    ///
+    /// An emitter that writes a computed value into a typed variable has to
+    /// store an object of the variable's type (`spirv-val`: "OpStore Pointer
+    /// <id>'s type does not match Object <id>'s type"), and the type is a
+    /// property of the producing instruction, so it is recorded here rather
+    /// than guessed by name.
+    pub fn type_of(&self, id: Id) -> Option<Id> {
+        self.result_types.get((id.0 as usize).wrapping_sub(1)).copied().flatten()
+    }
+
+    /// Records that `id` is a result of type `ty`.
+    fn record_type(&mut self, id: Id, ty: Option<Id>) {
+        let at = (id.0 as usize).wrapping_sub(1);
+        if self.result_types.len() <= at {
+            self.result_types.resize(at + 1, None);
+        }
+        self.result_types[at] = ty;
     }
 
     /// The largest id handed out so far (zero when none has been).
@@ -132,6 +175,9 @@ impl Module {
         words += usize::from(result.is_some());
         words += operands.len();
         assert!(words < 0x1_0000, "an instruction's word count is 16 bits");
+        if let Some(r) = result {
+            self.record_type(r, result_type);
+        }
         let section = &mut self.sections[Section::of(op) as usize];
         section.push((words as u32) << 16 | op as u32);
         if let Some(t) = result_type {
@@ -166,6 +212,9 @@ impl Module {
         words += usize::from(result.is_some());
         words += operands.len();
         assert!(words < 0x1_0000, "an instruction's word count is 16 bits");
+        if let Some(r) = result {
+            self.record_type(r, result_type);
+        }
         let section = &mut self.sections[Section::Function as usize];
         section.push((words as u32) << 16 | op as u32);
         if let Some(t) = result_type {

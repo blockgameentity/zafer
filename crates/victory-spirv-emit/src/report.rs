@@ -86,6 +86,9 @@ impl Report {
         for (k, n) in other.earlier {
             *self.earlier.entry(k).or_default() += n;
         }
+        for (k, n) in other.invalid {
+            *self.invalid.entry(k).or_default() += n;
+        }
     }
 
     /// The share of programs that emitted a module, `0.0` when none ran.

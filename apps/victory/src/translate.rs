@@ -265,12 +265,24 @@ pub fn run(
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
     println!(
-        "SPIR-V       {} emitted of {} programs ({:.0}% coverage); {} gap kinds",
+        "SPIR-V       {} emitted of {} programs ({:.0}% coverage); {} refused before the \
+         emitter, {} refused by it, {} invalid",
         t.spirv.emitted,
         t.spirv.programs,
         f64::from(t.spirv.coverage()) * 100.0,
+        t.spirv.earlier.len(),
         t.spirv.gaps.len(),
+        t.spirv.invalid.len(),
     );
+    for (reason, n) in &t.spirv.earlier {
+        println!("  {n:>7}  spirv earlier: {reason}");
+    }
+    for (reason, n) in t.spirv.ranked() {
+        println!("  {n:>7}  spirv: {reason}");
+    }
+    for (reason, n) in &t.spirv.invalid {
+        println!("  {n:>7}  spirv-val: {reason}");
+    }
     println!(
         "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
         t.emitted, t.emit_programs, t.validated, t.pipelines
